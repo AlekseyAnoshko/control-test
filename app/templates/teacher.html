@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Панель преподавателя</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; background:#0f172a; color:#e2e8f0;
+         margin:0; padding:2rem; }
+  .wrap { max-width:600px; margin:0 auto; }
+  h1 { font-size:1.5rem; }
+  .card { background:#1e293b; padding:1.5rem; border-radius:12px; margin-bottom:1.5rem;
+          box-shadow: 0 10px 30px rgba(0,0,0,.4); }
+  label { display:block; margin-bottom:.5rem; color:#94a3b8; }
+  input[type=number] { width:120px; padding:.6rem; border-radius:8px; border:1px solid #334155;
+          background:#0f172a; color:#e2e8f0; font-size:1rem; margin-right:.5rem; }
+  button { padding:.75rem 1.25rem; border:none; border-radius:8px; background:#2563eb;
+           color:white; font-size:1rem; cursor:pointer; margin-right:.5rem; margin-top:.5rem; }
+  button.secondary { background:#475569; }
+  button.danger { background:#dc2626; }
+  button:disabled { background:#334155; color:#64748b; cursor:not-allowed; }
+  .counter { font-size:2.5rem; font-weight:bold; }
+  .counter span { color:#64748b; font-size:1.5rem; }
+  .ready { color:#4ade80; }
+  .notready { color:#facc15; }
+  ul#studentList { list-style:none; padding:0; max-height:240px; overflow-y:auto; }
+  ul#studentList li { padding:.4rem .6rem; border-bottom:1px solid #334155; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Панель преподавателя</h1>
+
+  <div class="card">
+    <label for="expectedInput">Количество студентов в аудитории</label>
+    <input type="number" id="expectedInput" min="0" value="0" />
+    <button id="setBtn">Задать</button>
+  </div>
+
+  <div class="card">
+    <div class="counter">
+      <span id="connectedCount">0</span> <span>/ <span id="expectedCount">0</span> подключено</span>
+    </div>
+    <div id="readiness" class="notready">Ожидание подключения студентов…</div>
+    <button id="startBtn" disabled>Начать тест</button>
+    <button id="forceBtn" class="secondary">Начать принудительно</button>
+    <button id="resetBtn" class="danger">Сбросить</button>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:1.1rem; margin-top:0;">Подключённые студенты</h2>
+    <ul id="studentList"></ul>
+  </div>
+</div>
+
+<script>
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${proto}://${location.host}/ws/teacher`);
+
+const connectedEl = document.getElementById('connectedCount');
+const expectedEl = document.getElementById('expectedCount');
+const readinessEl = document.getElementById('readiness');
+const startBtn = document.getElementById('startBtn');
+const studentList = document.getElementById('studentList');
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  if (data.type === 'status') {
+    connectedEl.textContent = data.connected;
+    expectedEl.textContent = data.expected;
+    const ready = data.expected > 0 && data.connected >= data.expected;
+    startBtn.disabled = !ready || data.test_started;
+    readinessEl.textContent = data.test_started
+      ? 'Тест запущен'
+      : (ready ? 'Все студенты подключены — можно начинать' : 'Ожидание подключения студентов…');
+    readinessEl.className = data.test_started ? 'ready' : (ready ? 'ready' : 'notready');
+
+    studentList.innerHTML = '';
+    data.students.forEach((name) => {
+      const li = document.createElement('li');
+      li.textContent = name;
+      studentList.appendChild(li);
+    });
+  } else if (data.type === 'error') {
+    alert(data.message);
+  }
+};
+
+document.getElementById('setBtn').addEventListener('click', () => {
+  const value = parseInt(document.getElementById('expectedInput').value, 10) || 0;
+  ws.send(JSON.stringify({type: 'set_expected', value}));
+});
+
+startBtn.addEventListener('click', () => {
+  ws.send(JSON.stringify({type: 'start_test', force: false}));
+});
+
+document.getElementById('forceBtn').addEventListener('click', () => {
+  if (confirm('Начать тест, даже если не все студенты подключились?')) {
+    ws.send(JSON.stringify({type: 'start_test', force: true}));
+  }
+});
+
+document.getElementById('resetBtn').addEventListener('click', () => {
+  if (confirm('Сбросить состояние теста?')) {
+    ws.send(JSON.stringify({type: 'reset'}));
+  }
+});
+</script>
+</body>
+</html>

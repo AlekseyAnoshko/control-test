@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Тестирование</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; background:#0f172a; color:#e2e8f0;
+         margin:0; padding:1.5rem; }
+  .card { background:#1e293b; padding:1.5rem; border-radius:12px; max-width:600px; margin:0 auto; }
+  h1 { font-size:1.2rem; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Тест начат</h1>
+    <p>Здесь разместите вопросы теста. Имя студента: <span id="studentName"></span></p>
+  </div>
+<script>
+document.getElementById('studentName').textContent = sessionStorage.getItem('student_name') || '—';
+if (!sessionStorage.getItem('student_id')) {
+  window.location.href = '/';
+}
+</script>
+</body>
+</html>
