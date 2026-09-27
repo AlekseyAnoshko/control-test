@@ -9,18 +9,121 @@
          margin:0; padding:1.5rem; }
   .card { background:#1e293b; padding:1.5rem; border-radius:12px; max-width:600px; margin:0 auto; }
   h1 { font-size:1.2rem; }
+  .qtext { font-size:1.1rem; margin:1rem 0; }
+  .option { display:block; padding:.75rem; margin-bottom:.5rem; border-radius:8px;
+            border:1px solid #334155; cursor:pointer; }
+  .option.selected { border-color:#2563eb; background:#1e3a8a; }
+  input[type=text] { width:100%; padding:.75rem; border-radius:8px; border:1px solid #334155;
+          background:#0f172a; color:#e2e8f0; font-size:1rem; box-sizing:border-box; margin-top:.5rem; }
+  button { padding:.85rem 1.5rem; border:none; border-radius:8px; background:#2563eb;
+           color:white; font-size:1rem; cursor:pointer; margin-top:1rem; }
+  button:disabled { background:#475569; cursor:not-allowed; }
+  #status { margin-top:1rem; color:#94a3b8; }
+  #progress { color:#64748b; font-size:.9rem; }
 </style>
 </head>
 <body>
   <div class="card">
-    <h1>Тест начат</h1>
-    <p>Здесь разместите вопросы теста. Имя студента: <span id="studentName"></span></p>
+    <div id="progress"></div>
+    <h1 id="qtitle">Ожидание вопроса…</h1>
+    <div class="qtext" id="qtext"></div>
+    <div id="options"></div>
+    <button id="sendBtn" style="display:none;">Ответить</button>
+    <div id="status"></div>
   </div>
+
 <script>
-document.getElementById('studentName').textContent = sessionStorage.getItem('student_name') || '—';
 if (!sessionStorage.getItem('student_id')) {
   window.location.href = '/';
 }
+
+const studentName = sessionStorage.getItem('student_name') || 'Студент';
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${proto}://${location.host}/ws/student?name=${encodeURIComponent(studentName)}`);
+
+let currentQuestion = null;
+let selectedIndices = new Set();
+
+const qtitle = document.getElementById('qtitle');
+const qtext = document.getElementById('qtext');
+const optionsEl = document.getElementById('options');
+const sendBtn = document.getElementById('sendBtn');
+const statusEl = document.getElementById('status');
+const progressEl = document.getElementById('progress');
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+
+  if (data.type === 'question') {
+    currentQuestion = data.question;
+    selectedIndices = new Set();
+    progressEl.textContent = `Вопрос ${data.index + 1} из ${data.total}`;
+    qtitle.textContent = currentQuestion.title;
+    qtext.textContent = currentQuestion.text;
+    optionsEl.innerHTML = '';
+    statusEl.textContent = '';
+    sendBtn.style.display = 'inline-block';
+    sendBtn.disabled = false;
+
+    if (currentQuestion.type === 'short_answer') {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = 'shortAnswerInput';
+      input.placeholder = 'Введите ответ';
+      optionsEl.appendChild(input);
+    } else {
+      currentQuestion.answers.forEach((text, idx) => {
+        const div = document.createElement('div');
+        div.className = 'option';
+        div.textContent = text;
+        div.dataset.index = idx;
+        div.addEventListener('click', () => {
+          if (currentQuestion.type === 'true_false') {
+            selectedIndices = new Set([idx]);
+            document.querySelectorAll('.option').forEach(o => o.classList.remove('selected'));
+            div.classList.add('selected');
+          } else {
+            if (selectedIndices.has(idx)) {
+              selectedIndices.delete(idx);
+              div.classList.remove('selected');
+            } else {
+              selectedIndices.add(idx);
+              div.classList.add('selected');
+            }
+          }
+        });
+        optionsEl.appendChild(div);
+      });
+    }
+  } else if (data.type === 'finished') {
+    qtitle.textContent = 'Тест завершён';
+    qtext.textContent = 'Спасибо за участие!';
+    optionsEl.innerHTML = '';
+    sendBtn.style.display = 'none';
+    progressEl.textContent = '';
+  }
+};
+
+sendBtn.addEventListener('click', () => {
+  if (!currentQuestion) return;
+  let value;
+  if (currentQuestion.type === 'short_answer') {
+    value = document.getElementById('shortAnswerInput').value.trim();
+  } else if (currentQuestion.type === 'true_false') {
+    value = currentQuestion.answers[[...selectedIndices][0]];
+  } else {
+    value = [...selectedIndices];
+  }
+  ws.send(JSON.stringify({type: 'answer', question_id: currentQuestion.id, value}));
+  statusEl.textContent = 'Ответ отправлен. Ожидайте следующий вопрос.';
+  sendBtn.disabled = true;
+});
+
+setInterval(() => {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({type: 'ping'}));
+  }
+}, 20000);
 </script>
 </body>
 </html>

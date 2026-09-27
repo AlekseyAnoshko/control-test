@@ -7,13 +7,15 @@
 <style>
   body { font-family: -apple-system, Arial, sans-serif; background:#0f172a; color:#e2e8f0;
          margin:0; padding:2rem; }
-  .wrap { max-width:600px; margin:0 auto; }
+  .wrap { max-width:700px; margin:0 auto; }
   h1 { font-size:1.5rem; }
+  h2 { font-size:1.1rem; margin-top:0; }
   .card { background:#1e293b; padding:1.5rem; border-radius:12px; margin-bottom:1.5rem;
           box-shadow: 0 10px 30px rgba(0,0,0,.4); }
   label { display:block; margin-bottom:.5rem; color:#94a3b8; }
   input[type=number] { width:120px; padding:.6rem; border-radius:8px; border:1px solid #334155;
           background:#0f172a; color:#e2e8f0; font-size:1rem; margin-right:.5rem; }
+  input[type=file] { color:#e2e8f0; margin-bottom:.75rem; display:block; }
   button { padding:.75rem 1.25rem; border:none; border-radius:8px; background:#2563eb;
            color:white; font-size:1rem; cursor:pointer; margin-right:.5rem; margin-top:.5rem; }
   button.secondary { background:#475569; }
@@ -23,13 +25,27 @@
   .counter span { color:#64748b; font-size:1.5rem; }
   .ready { color:#4ade80; }
   .notready { color:#facc15; }
-  ul#studentList { list-style:none; padding:0; max-height:240px; overflow-y:auto; }
+  ul#studentList { list-style:none; padding:0; max-height:200px; overflow-y:auto; }
   ul#studentList li { padding:.4rem .6rem; border-bottom:1px solid #334155; }
+  table { width:100%; border-collapse:collapse; margin-top:.5rem; }
+  th, td { text-align:left; padding:.5rem; border-bottom:1px solid #334155; }
+  .badge { padding:.2rem .5rem; border-radius:6px; font-size:.85rem; }
+  .badge.uploaded { background:#14532d; color:#4ade80; }
+  .badge.missing { background:#450a0a; color:#f87171; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Панель преподавателя</h1>
+
+  <div class="card">
+    <h2>Тест (формат GIFT)</h2>
+    <input type="file" id="giftFile" accept=".gift,.txt" />
+    <button id="uploadBtn">Загрузить тест</button>
+    <div id="uploadStatus" style="margin-top:.5rem;">
+      <span class="badge missing" id="questionsBadge">Тест не загружен</span>
+    </div>
+  </div>
 
   <div class="card">
     <label for="expectedInput">Количество студентов в аудитории</label>
@@ -44,12 +60,25 @@
     <div id="readiness" class="notready">Ожидание подключения студентов…</div>
     <button id="startBtn" disabled>Начать тест</button>
     <button id="forceBtn" class="secondary">Начать принудительно</button>
+    <button id="nextBtn" class="secondary" disabled>Следующий вопрос</button>
     <button id="resetBtn" class="danger">Сбросить</button>
+    <div id="questionInfo" style="margin-top:.75rem; color:#94a3b8;"></div>
   </div>
 
   <div class="card">
-    <h2 style="font-size:1.1rem; margin-top:0;">Подключённые студенты</h2>
+    <h2>Подключённые студенты</h2>
     <ul id="studentList"></ul>
+  </div>
+
+  <div class="card">
+    <h2>Результаты</h2>
+    <button id="refreshResultsBtn" class="secondary">Обновить результаты</button>
+    <table id="resultsTable">
+      <thead>
+        <tr><th>Студент</th><th>Отвечено</th><th>Правильно</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 </div>
 
@@ -61,7 +90,10 @@ const connectedEl = document.getElementById('connectedCount');
 const expectedEl = document.getElementById('expectedCount');
 const readinessEl = document.getElementById('readiness');
 const startBtn = document.getElementById('startBtn');
+const nextBtn = document.getElementById('nextBtn');
 const studentList = document.getElementById('studentList');
+const questionsBadge = document.getElementById('questionsBadge');
+const questionInfo = document.getElementById('questionInfo');
 
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
@@ -69,11 +101,23 @@ ws.onmessage = (event) => {
     connectedEl.textContent = data.connected;
     expectedEl.textContent = data.expected;
     const ready = data.expected > 0 && data.connected >= data.expected;
-    startBtn.disabled = !ready || data.test_started;
+    const hasQuestions = data.questions_loaded > 0;
+
+    startBtn.disabled = !ready || data.test_started || !hasQuestions;
+    nextBtn.disabled = !data.test_started;
+
     readinessEl.textContent = data.test_started
-      ? 'Тест запущен'
+      ? `Тест запущен, вопрос ${data.current_index + 1} из ${data.questions_loaded}`
       : (ready ? 'Все студенты подключены — можно начинать' : 'Ожидание подключения студентов…');
     readinessEl.className = data.test_started ? 'ready' : (ready ? 'ready' : 'notready');
+
+    if (hasQuestions) {
+      questionsBadge.textContent = `Загружено вопросов: ${data.questions_loaded}`;
+      questionsBadge.className = 'badge uploaded';
+    } else {
+      questionsBadge.textContent = 'Тест не загружен';
+      questionsBadge.className = 'badge missing';
+    }
 
     studentList.innerHTML = '';
     data.students.forEach((name) => {
@@ -85,6 +129,23 @@ ws.onmessage = (event) => {
     alert(data.message);
   }
 };
+
+document.getElementById('uploadBtn').addEventListener('click', async () => {
+  const fileInput = document.getElementById('giftFile');
+  if (!fileInput.files.length) {
+    alert('Выберите файл теста в формате GIFT');
+    return;
+  }
+  const formData = new FormData();
+  formData.append('file', fileInput.files[0]);
+  const resp = await fetch('/api/upload_test', { method: 'POST', body: formData });
+  const result = await resp.json();
+  if (result.ok) {
+    alert(`Загружено вопросов: ${result.count}`);
+  } else {
+    alert(`Ошибка: ${result.error}`);
+  }
+});
 
 document.getElementById('setBtn').addEventListener('click', () => {
   const value = parseInt(document.getElementById('expectedInput').value, 10) || 0;
@@ -101,11 +162,29 @@ document.getElementById('forceBtn').addEventListener('click', () => {
   }
 });
 
+nextBtn.addEventListener('click', () => {
+  ws.send(JSON.stringify({type: 'next_question'}));
+});
+
 document.getElementById('resetBtn').addEventListener('click', () => {
-  if (confirm('Сбросить состояние теста?')) {
+  if (confirm('Сбросить состояние теста? Загруженные вопросы тоже будут удалены.')) {
     ws.send(JSON.stringify({type: 'reset'}));
   }
 });
+
+async function loadResults() {
+  const resp = await fetch('/api/results');
+  const data = await resp.json();
+  const tbody = document.querySelector('#resultsTable tbody');
+  tbody.innerHTML = '';
+  data.results.forEach((r) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${r.name}</td><td>${r.answered}/${data.total_questions}</td><td>${r.correct}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+document.getElementById('refreshResultsBtn').addEventListener('click', loadResults);
 </script>
 </body>
 </html>
