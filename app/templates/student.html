@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Тестирование · Control Test</title>
+  <link rel="stylesheet" href="/static/student.css">
+  <script src="/static/student.js" defer></script>
+</head>
+<body>
+<div class="shell">
+  <header class="site-header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">CT</span><div>Control Test<div class="brand-subtitle">Тестирование в аудитории</div></div></div>
+    <div class="connection" id="connection" data-state="idle" role="status"><span class="dot" aria-hidden="true"></span><span id="connectionText">Локальная сеть</span></div>
+  </header>
+  <main>
+    <div class="intro"><p class="eyebrow">Рабочее место студента</p><h1 id="pageTitle">Всё готово. Начнём?</h1><p class="muted" id="pageDescription">Представьтесь, чтобы присоединиться к тестированию.</p></div>
+    <div class="offline-banner" id="offlineBanner" hidden role="status"><p>Связь с сервером потеряна. Подключаемся снова…</p><button type="button" id="retryBtn">Повторить сейчас</button></div>
+    <div class="layout">
+      <section>
+        <div class="card" id="joinPanel">
+          <form id="joinForm">
+            <label class="section-label" for="nameInput">Фамилия и имя</label>
+            <input class="text-input" id="nameInput" name="name" type="text" placeholder="Например, Иванов Алексей" autocomplete="name" maxlength="100" required aria-describedby="nameHelp joinStatus">
+            <p class="helper" id="nameHelp">Так преподаватель увидит вас в списке участников.</p>
+            <div class="join-actions"><button class="primary" id="joinBtn" type="submit">Присоединиться</button><span class="small-note">Вопросы появятся после запуска теста преподавателем.</span></div>
+            <p class="notice" id="joinStatus" role="status"></p>
+          </form>
+        </div>
+        <div class="card state-card" id="statePanel" hidden>
+          <div class="state-icon" id="stateIcon" aria-hidden="true">○</div>
+          <h2 class="state-title" id="stateTitle" tabindex="-1">Вы в списке участников</h2>
+          <p class="state-copy" id="stateCopy">Ждём начала тестирования. Первый вопрос появится здесь автоматически.</p>
+          <button class="secondary" id="changeNameBtn" type="button">Изменить имя</button>
+        </div>
+        <div class="card" id="questionPanel" hidden>
+          <div class="question-meta"><span id="progressText"></span><span id="questionType"></span></div>
+          <div class="progress-track" id="progressBar" role="progressbar" aria-label="Ход тестирования" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill" id="progressFill"></div></div>
+          <h2 class="question-title" id="questionTitle" tabindex="-1"></h2>
+          <p class="question-copy" id="questionText"></p>
+          <form id="answerForm">
+            <fieldset class="answers" id="answers"><legend id="answerHint">Выберите ответ</legend><div id="options"></div></fieldset>
+            <div class="question-actions"><p class="notice" id="answerStatus" role="status">Выберите ответ, затем нажмите кнопку.</p><button class="primary" id="sendBtn" type="submit" disabled>Отправить ответ</button></div>
+          </form>
+        </div>
+      </section>
+      <aside class="card side-card" id="sideCard">
+        <div class="side-title">Участник</div><p class="student-name" id="studentName">Вы ещё не представились</p>
+        <div class="side-help"><hr class="side-line"><p class="side-note">Вопросы переключает преподаватель. Отвечайте в своём темпе до перехода к следующему вопросу.</p><p class="side-note">Оставайтесь в Wi-Fi сети аудитории. При потере связи страница попробует подключиться снова.</p></div>
+      </aside>
+    </div>
+  </main>
+  <footer class="footer"><span>Control Test</span><span>Локальное тестирование</span></footer>
+</div>
+<noscript>Для прохождения теста включите JavaScript в браузере.</noscript>
+</body>
+</html>

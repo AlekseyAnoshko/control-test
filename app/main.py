@@ -60,6 +60,7 @@ class Question:
             "title": self.title,
             "text": self.text,
             "type": self.qtype,
+            "multiple": self.qtype == "multiple_choice" and sum(a.correct for a in self.answers) > 1,
             "answers": [a.text for a in self.answers] if self.qtype != "short_answer" else [],
         }
 
@@ -160,6 +161,7 @@ class AppState:
     def __init__(self) -> None:
         self.expected: int = 0
         self.test_started: bool = False
+        self.test_finished: bool = False
         self.questions: list[Question] = []
         self.current_index: int = -1
         # student_id -> {"name": str, "ws": WebSocket}
@@ -170,7 +172,7 @@ class AppState:
         self.lock = asyncio.Lock()
 
     def connected_count(self) -> int:
-        return len(self.students)
+        return sum(s.get("ws") is not None for s in self.students.values())
 
 
 state = AppState()
@@ -184,10 +186,10 @@ async def notify_teachers() -> None:
         "test_started": state.test_started,
         "questions_loaded": len(state.questions),
         "current_index": state.current_index,
-        "students": [s["name"] for s in state.students.values()],
+        "students": [s["name"] for s in state.students.values() if s.get("ws") is not None],
     }
     dead = []
-    for ws in state.teacher_sockets:
+    for ws in tuple(state.teacher_sockets):
         try:
             await ws.send_json(payload)
         except Exception:
@@ -200,13 +202,15 @@ async def broadcast_question(question: Question) -> None:
     payload = {"type": "question", "index": state.current_index,
                "total": len(state.questions), "question": question.to_public_dict()}
     dead_ids = []
-    for sid, info in state.students.items():
+    for sid, info in tuple(state.students.items()):
+        if info.get("ws") is None:
+            continue
         try:
             await info["ws"].send_json(payload)
         except Exception:
             dead_ids.append(sid)
     for sid in dead_ids:
-        state.students.pop(sid, None)
+        state.students[sid]["ws"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +219,7 @@ async def broadcast_question(question: Question) -> None:
 
 @app.get("/", response_class=HTMLResponse)
 async def join_page(request: Request):
-    return templates.TemplateResponse(request, "join.html", {})
+    return templates.TemplateResponse(request, "student.html", {})
 
 
 @app.get("/teacher", response_class=HTMLResponse)
@@ -225,7 +229,7 @@ async def teacher_page(request: Request):
 
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(request: Request):
-    return templates.TemplateResponse(request, "test.html", {})
+    return templates.TemplateResponse(request, "student.html", {})
 
 
 @app.get("/healthz")
@@ -235,6 +239,8 @@ async def healthz():
 
 @app.post("/api/upload_test")
 async def upload_test(file: UploadFile = File(...)):
+    if state.test_started:
+        return JSONResponse({"ok": False, "error": "Сначала завершите текущий тест"}, status_code=409)
     content = (await file.read()).decode("utf-8", errors="replace")
     questions = parse_gift(content)
     if not questions:
@@ -242,6 +248,7 @@ async def upload_test(file: UploadFile = File(...)):
 
     async with state.lock:
         state.questions = questions
+        state.test_finished = False
         state.current_index = -1
         state.answers = {}
 
@@ -273,43 +280,69 @@ async def get_results():
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/student")
-async def ws_student(websocket: WebSocket, name: str = "Студент"):
+async def ws_student(websocket: WebSocket, name: str = "Студент", student_id: str = ""):
     await websocket.accept()
-    student_id = str(uuid.uuid4())
-
+    name = name.strip()[:100] or "Студент"
     async with state.lock:
+        if student_id not in state.students:
+            student_id = str(uuid.uuid4())
+        previous = state.students.get(student_id, {}).get("ws")
         state.students[student_id] = {"name": name, "ws": websocket}
         state.answers.setdefault(student_id, {})
-
+    if previous is not None:
+        await previous.close(code=4001)
     await notify_teachers()
     await websocket.send_json({
-        "type": "joined",
-        "student_id": student_id,
-        "test_started": state.test_started,
+        "type": "joined", "student_id": student_id,
+        "test_started": state.test_started, "test_finished": state.test_finished,
     })
-
+    if state.test_finished:
+        await websocket.send_json({"type": "finished"})
+    elif state.test_started and 0 <= state.current_index < len(state.questions):
+        question = state.questions[state.current_index]
+        saved = state.answers[student_id]
+        await websocket.send_json({
+            "type": "question", "index": state.current_index, "total": len(state.questions),
+            "question": question.to_public_dict(),
+            "answered": question.id in saved, "answer": saved.get(question.id),
+        })
     try:
         while True:
             msg = await websocket.receive_json()
-            msg_type = msg.get("type")
-
-            if msg_type == "ping":
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
-
-            elif msg_type == "answer":
-                qid = msg.get("question_id")
-                value = msg.get("value")
+            elif msg.get("type") == "answer":
+                qid, value = msg.get("question_id"), msg.get("value")
                 async with state.lock:
-                    state.answers.setdefault(student_id, {})[qid] = value
+                    if state.students[student_id].get("ws") is not websocket:
+                        break
+                    question = state.questions[state.current_index] if state.test_started and 0 <= state.current_index < len(state.questions) else None
+                    valid = question is not None and qid == question.id
+                    if valid and question.qtype == "short_answer":
+                        valid = isinstance(value, str) and 0 < len(value.strip()) <= 2000
+                        if valid:
+                            value = value.strip()
+                    elif valid and question.qtype == "true_false":
+                        valid = isinstance(value, str) and value in ("TRUE", "FALSE")
+                    elif valid:
+                        valid = (isinstance(value, list) and 0 < len(value) <= len(question.answers)
+                                 and all(type(v) is int and 0 <= v < len(question.answers) for v in value)
+                                 and len(set(value)) == len(value))
+                    if valid:
+                        state.answers.setdefault(student_id, {}).setdefault(qid, value)
+                if not valid:
+                    await websocket.send_json({"type": "error", "message": "Ответ не принят. Проверьте, что вопрос ещё открыт и ответ заполнен."})
+                    continue
+                await websocket.send_json({"type": "answer_saved", "question_id": qid})
                 await notify_teachers()
-
     except WebSocketDisconnect:
-        pass
-    except Exception:
         pass
     finally:
         async with state.lock:
-            state.students.pop(student_id, None)
+            if state.students.get(student_id, {}).get("ws") is websocket:
+                state.students[student_id]["ws"] = None
         await notify_teachers()
 
 
@@ -337,11 +370,14 @@ async def ws_teacher(websocket: WebSocket):
                 await notify_teachers()
 
             elif action == "start_test":
+                if state.test_started:
+                    continue
                 force = bool(data.get("force", False))
                 ready = state.connected_count() >= state.expected and state.expected > 0
                 has_questions = len(state.questions) > 0
                 if (ready or force) and has_questions:
                     state.test_started = True
+                    state.test_finished = False
                     state.current_index = 0
                     await broadcast_question(state.questions[0])
                     await notify_teachers()
@@ -351,27 +387,40 @@ async def ws_teacher(websocket: WebSocket):
                     await websocket.send_json({"type": "error", "message": "Не все студенты подключились"})
 
             elif action == "next_question":
+                if not state.test_started:
+                    continue
                 if state.current_index + 1 < len(state.questions):
                     state.current_index += 1
                     await broadcast_question(state.questions[state.current_index])
                     await notify_teachers()
                 else:
+                    state.test_started = False
+                    state.test_finished = True
                     dead_ids = []
-                    for sid, info in state.students.items():
+                    for sid, info in tuple(state.students.items()):
+                        if info.get("ws") is None:
+                            continue
                         try:
                             await info["ws"].send_json({"type": "finished"})
                         except Exception:
                             dead_ids.append(sid)
                     for sid in dead_ids:
-                        state.students.pop(sid, None)
+                        state.students[sid]["ws"] = None
                     await notify_teachers()
 
             elif action == "reset":
                 state.test_started = False
+                state.test_finished = False
                 state.expected = 0
                 state.questions = []
                 state.current_index = -1
                 state.answers = {}
+                for info in tuple(state.students.values()):
+                    if info.get("ws") is not None:
+                        try:
+                            await info["ws"].send_json({"type": "reset"})
+                        except Exception:
+                            pass
                 await notify_teachers()
 
     except WebSocketDisconnect:
