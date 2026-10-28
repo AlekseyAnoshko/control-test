@@ -1,0 +1,15 @@
+[Unit]
+Description=Control-test AP DHCP and filtered DNS
+Requires=NetworkManager.service control-test-firewall.service
+After=NetworkManager.service control-test-firewall.service
+Conflicts=dnsmasq.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/dnsmasq --test --conf-file=/etc/control-test/dnsmasq.conf
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/control-test/dnsmasq.conf --pid-file=/run/control-test-dnsmasq.pid
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

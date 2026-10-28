@@ -20,17 +20,36 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
+import time
+from datetime import datetime, timezone
+from urllib.parse import quote
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
+from app.report import build_report, upload_name
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-app = FastAPI(title="Control Test")
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    task = state.timer_task
+    if task is not None:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
-templates = Jinja2Templates(directory="app/templates")
+
+app = FastAPI(title="Control Test", lifespan=lifespan)
+
+APP_DIR = Path(__file__).resolve().parent
+if (APP_DIR / "static").is_dir():
+    app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=APP_DIR / "templates")
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +76,7 @@ class Question:
             "title": self.title,
             "text": self.text,
             "type": self.qtype,
+            "multiple": self.qtype == "multiple_choice" and sum(a.correct for a in self.answers) > 1,
             "answers": [a.text for a in self.answers] if self.qtype != "short_answer" else [],
         }
 
@@ -157,8 +177,17 @@ class AppState:
     def __init__(self) -> None:
         self.expected: int = 0
         self.test_started: bool = False
+        self.test_finished: bool = False
         self.questions: list[Question] = []
         self.current_index: int = -1
+        self.test_filename: str = ""
+        self.started_at: datetime | None = None
+        self.finished_at: datetime | None = None
+        self.participant_ids: set[str] = set()
+        self.question_seconds: int = 60
+        self.deadline: float | None = None
+        self.timer_task: asyncio.Task | None = None
+        self.timer_generation: int = 0
         # student_id -> {"name": str, "ws": WebSocket}
         self.students: dict[str, dict] = {}
         # student_id -> {question_id: answer}
@@ -167,7 +196,7 @@ class AppState:
         self.lock = asyncio.Lock()
 
     def connected_count(self) -> int:
-        return len(self.students)
+        return sum(s.get("ws") is not None for s in self.students.values())
 
 
 state = AppState()
@@ -179,12 +208,15 @@ async def notify_teachers() -> None:
         "connected": state.connected_count(),
         "expected": state.expected,
         "test_started": state.test_started,
+        "test_finished": state.test_finished,
         "questions_loaded": len(state.questions),
+        "test_filename": state.test_filename,
         "current_index": state.current_index,
-        "students": [s["name"] for s in state.students.values()],
+        **timer_payload(),
+        "students": [s["name"] for s in state.students.values() if s.get("ws") is not None],
     }
     dead = []
-    for ws in state.teacher_sockets:
+    for ws in tuple(state.teacher_sockets):
         try:
             await ws.send_json(payload)
         except Exception:
@@ -195,15 +227,67 @@ async def notify_teachers() -> None:
 
 async def broadcast_question(question: Question) -> None:
     payload = {"type": "question", "index": state.current_index,
-               "total": len(state.questions), "question": question.to_public_dict()}
+               "total": len(state.questions), "question": question.to_public_dict(), **timer_payload()}
     dead_ids = []
-    for sid, info in state.students.items():
+    for sid, info in tuple(state.students.items()):
+        if info.get("ws") is None:
+            continue
         try:
             await info["ws"].send_json(payload)
         except Exception:
             dead_ids.append(sid)
     for sid in dead_ids:
-        state.students.pop(sid, None)
+        state.students[sid]["ws"] = None
+
+
+def timer_payload() -> dict:
+    return {"question_seconds": state.question_seconds,
+            "remaining_seconds": max(0, state.deadline - time.monotonic()) if state.deadline is not None else None}
+
+
+def cancel_question_timer() -> None:
+    state.timer_generation += 1
+    task = state.timer_task
+    state.timer_task = None
+    state.deadline = None
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+
+
+def schedule_question_timer() -> None:
+    # Called while holding state.lock; generation prevents an old timer from advancing a new question.
+    cancel_question_timer()
+    state.deadline = time.monotonic() + state.question_seconds
+    state.timer_task = asyncio.create_task(expire_question(state, state.timer_generation, state.deadline))
+
+
+async def expire_question(owner: AppState, generation: int, deadline: float) -> None:
+    await asyncio.sleep(max(0, deadline - time.monotonic()))
+    async with owner.lock:
+        if owner is not state or generation != owner.timer_generation or not owner.test_started:
+            return
+        await advance_question_locked()
+
+
+async def advance_question_locked() -> None:
+    if not state.test_started:
+        return
+    if state.current_index + 1 < len(state.questions):
+        state.current_index += 1
+        schedule_question_timer()
+        await broadcast_question(state.questions[state.current_index])
+    else:
+        cancel_question_timer()
+        state.test_started = False
+        state.test_finished = True
+        state.finished_at = datetime.now(timezone.utc)
+        for info in tuple(state.students.values()):
+            if info.get("ws") is not None:
+                try:
+                    await info["ws"].send_json({"type": "finished"})
+                except Exception:
+                    info["ws"] = None
+    await notify_teachers()
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +296,7 @@ async def broadcast_question(question: Question) -> None:
 
 @app.get("/", response_class=HTMLResponse)
 async def join_page(request: Request):
-    return templates.TemplateResponse(request, "join.html", {})
+    return templates.TemplateResponse(request, "student.html", {})
 
 
 @app.get("/teacher", response_class=HTMLResponse)
@@ -222,7 +306,7 @@ async def teacher_page(request: Request):
 
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(request: Request):
-    return templates.TemplateResponse(request, "test.html", {})
+    return templates.TemplateResponse(request, "student.html", {})
 
 
 @app.get("/healthz")
@@ -232,13 +316,22 @@ async def healthz():
 
 @app.post("/api/upload_test")
 async def upload_test(file: UploadFile = File(...)):
+    if state.test_started:
+        return JSONResponse({"ok": False, "error": "Сначала завершите текущий тест"}, status_code=409)
     content = (await file.read()).decode("utf-8", errors="replace")
     questions = parse_gift(content)
     if not questions:
         return JSONResponse({"ok": False, "error": "Не удалось распознать вопросы в файле"}, status_code=400)
 
     async with state.lock:
+        if state.test_started:
+            return JSONResponse({"ok": False, "error": "Сначала завершите текущий тест"}, status_code=409)
+        cancel_question_timer()
         state.questions = questions
+        state.test_filename = upload_name(file.filename)
+        state.started_at = state.finished_at = None
+        state.participant_ids = set()
+        state.test_finished = False
         state.current_index = -1
         state.answers = {}
 
@@ -260,9 +353,37 @@ async def get_results():
             "name": info["name"],
             "answered": len(student_answers),
             "correct": correct_count,
+            "incorrect": len(state.questions) - correct_count,
+            "unanswered": len(state.questions) - len(student_answers),
             "total": len(state.questions),
         })
     return {"results": rows, "total_questions": len(state.questions)}
+
+
+@app.get("/api/results/report.docx")
+async def download_report():
+    async with state.lock:
+        if not state.test_finished:
+            return JSONResponse({"ok": False, "error": "Отчёт доступен после завершения тестирования"}, status_code=409)
+        total = len(state.questions)
+        rows = []
+        for sid, info in state.students.items():
+            if sid not in state.participant_ids:
+                continue
+            answers = state.answers.get(sid, {})
+            answered = sum(q.id in answers for q in state.questions)
+            correct = sum(q.id in answers and q.check(answers[q.id]) for q in state.questions)
+            rows.append({"name": info["name"], "answered": answered, "correct": correct,
+                         "incorrect": total - correct, "unanswered": total - answered,
+                         "percent": 100 * correct / total if total else 0})
+        snapshot = {"test_filename": state.test_filename or "Тест.gift", "started_at": state.started_at,
+                    "finished_at": state.finished_at, "question_seconds": state.question_seconds,
+                    "total_questions": total, "students": rows}
+    content = await run_in_threadpool(build_report, snapshot)
+    filename = "Отчёт " + Path(snapshot["test_filename"]).stem + ".docx"
+    return Response(content, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": "attachment; filename=report.docx; filename*=UTF-8''" + quote(filename, safe=''),
+                             "Cache-Control": "no-store"})
 
 
 # ---------------------------------------------------------------------------
@@ -270,43 +391,73 @@ async def get_results():
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/student")
-async def ws_student(websocket: WebSocket, name: str = "Студент"):
+async def ws_student(websocket: WebSocket, name: str = "Студент", student_id: str = ""):
     await websocket.accept()
-    student_id = str(uuid.uuid4())
-
+    name = name.strip()[:100] or "Студент"
     async with state.lock:
+        if student_id not in state.students:
+            student_id = str(uuid.uuid4())
+        previous = state.students.get(student_id, {}).get("ws")
         state.students[student_id] = {"name": name, "ws": websocket}
         state.answers.setdefault(student_id, {})
-
+        if state.test_started:
+            state.participant_ids.add(student_id)
+    if previous is not None:
+        await previous.close(code=4001)
     await notify_teachers()
     await websocket.send_json({
-        "type": "joined",
-        "student_id": student_id,
-        "test_started": state.test_started,
+        "type": "joined", "student_id": student_id,
+        "test_started": state.test_started, "test_finished": state.test_finished,
     })
-
+    if state.test_finished:
+        await websocket.send_json({"type": "finished"})
+    elif state.test_started and 0 <= state.current_index < len(state.questions):
+        question = state.questions[state.current_index]
+        saved = state.answers[student_id]
+        await websocket.send_json({
+            "type": "question", "index": state.current_index, "total": len(state.questions),
+            "question": question.to_public_dict(),
+            "answered": question.id in saved, "answer": saved.get(question.id),
+            **timer_payload(),
+        })
     try:
         while True:
             msg = await websocket.receive_json()
-            msg_type = msg.get("type")
-
-            if msg_type == "ping":
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
-
-            elif msg_type == "answer":
-                qid = msg.get("question_id")
-                value = msg.get("value")
+            elif msg.get("type") == "answer":
+                qid, value = msg.get("question_id"), msg.get("value")
                 async with state.lock:
-                    state.answers.setdefault(student_id, {})[qid] = value
+                    if state.students[student_id].get("ws") is not websocket:
+                        break
+                    question = state.questions[state.current_index] if state.test_started and 0 <= state.current_index < len(state.questions) else None
+                    valid = (question is not None and qid == question.id
+                             and (state.deadline is None or time.monotonic() < state.deadline))
+                    if valid and question.qtype == "short_answer":
+                        valid = isinstance(value, str) and 0 < len(value.strip()) <= 2000
+                        if valid:
+                            value = value.strip()
+                    elif valid and question.qtype == "true_false":
+                        valid = isinstance(value, str) and value in ("TRUE", "FALSE")
+                    elif valid:
+                        valid = (isinstance(value, list) and 0 < len(value) <= len(question.answers)
+                                 and all(type(v) is int and 0 <= v < len(question.answers) for v in value)
+                                 and len(set(value)) == len(value))
+                    if valid:
+                        state.answers.setdefault(student_id, {}).setdefault(qid, value)
+                if not valid:
+                    await websocket.send_json({"type": "error", "question_id": qid, "message": "Ответ не принят: время вышло, вопрос сменился или ответ не заполнен."})
+                    continue
+                await websocket.send_json({"type": "answer_saved", "question_id": qid})
                 await notify_teachers()
-
     except WebSocketDisconnect:
-        pass
-    except Exception:
         pass
     finally:
         async with state.lock:
-            state.students.pop(student_id, None)
+            if state.students.get(student_id, {}).get("ws") is websocket:
+                state.students[student_id]["ws"] = None
         await notify_teachers()
 
 
@@ -333,43 +484,72 @@ async def ws_teacher(websocket: WebSocket):
                 state.expected = max(0, value)
                 await notify_teachers()
 
+            elif action == "set_question_seconds":
+                value = data.get("value")
+                async with state.lock:
+                    if state.test_started:
+                        error = "Время можно менять только до начала теста"
+                    elif type(value) is not int or not 1 <= value <= 3600:
+                        error = "Укажите целое число секунд от 1 до 3600"
+                    else:
+                        state.question_seconds = value
+                        error = None
+                if error:
+                    await websocket.send_json({"type": "error", "message": error})
+                await notify_teachers()
+
             elif action == "start_test":
-                force = bool(data.get("force", False))
-                ready = state.connected_count() >= state.expected and state.expected > 0
-                has_questions = len(state.questions) > 0
-                if (ready or force) and has_questions:
-                    state.test_started = True
-                    state.current_index = 0
-                    await broadcast_question(state.questions[0])
-                    await notify_teachers()
-                elif not has_questions:
-                    await websocket.send_json({"type": "error", "message": "Сначала загрузите тест (GIFT-файл)"})
-                else:
-                    await websocket.send_json({"type": "error", "message": "Не все студенты подключились"})
+                async with state.lock:
+                    if state.test_started:
+                        continue
+                    duration = data.get("question_seconds", state.question_seconds)
+                    if type(duration) is not int or not 1 <= duration <= 3600:
+                        await websocket.send_json({"type": "error", "message": "Укажите целое число секунд от 1 до 3600"})
+                        continue
+                    state.question_seconds = duration
+                    force = bool(data.get("force", False))
+                    ready = state.connected_count() >= state.expected and state.expected > 0
+                    if (ready or force) and state.questions:
+                        state.test_started = True
+                        state.test_finished = False
+                        state.current_index = 0
+                        state.started_at = datetime.now(timezone.utc)
+                        state.finished_at = None
+                        state.participant_ids = {sid for sid, info in state.students.items() if info.get("ws") is not None}
+                        state.answers = {}
+                        schedule_question_timer()
+                        await broadcast_question(state.questions[0])
+                        await notify_teachers()
+                    else:
+                        message = "Сначала загрузите тест (GIFT-файл)" if not state.questions else "Не все студенты подключились"
+                        await websocket.send_json({"type": "error", "message": message})
 
             elif action == "next_question":
-                if state.current_index + 1 < len(state.questions):
-                    state.current_index += 1
-                    await broadcast_question(state.questions[state.current_index])
-                    await notify_teachers()
-                else:
-                    dead_ids = []
-                    for sid, info in state.students.items():
-                        try:
-                            await info["ws"].send_json({"type": "finished"})
-                        except Exception:
-                            dead_ids.append(sid)
-                    for sid in dead_ids:
-                        state.students.pop(sid, None)
-                    await notify_teachers()
+                async with state.lock:
+                    # If expiry already moved the class, do not skip another question.
+                    expected_index = data.get("current_index", state.current_index)
+                    if expected_index == state.current_index:
+                        await advance_question_locked()
 
             elif action == "reset":
-                state.test_started = False
-                state.expected = 0
-                state.questions = []
-                state.current_index = -1
-                state.answers = {}
-                await notify_teachers()
+                async with state.lock:
+                    cancel_question_timer()
+                    state.test_started = False
+                    state.test_finished = False
+                    state.expected = 0
+                    state.questions = []
+                    state.test_filename = ""
+                    state.started_at = state.finished_at = None
+                    state.participant_ids = set()
+                    state.current_index = -1
+                    state.answers = {}
+                    for info in tuple(state.students.values()):
+                        if info.get("ws") is not None:
+                            try:
+                                await info["ws"].send_json({"type": "reset"})
+                            except Exception:
+                                pass
+                    await notify_teachers()
 
     except WebSocketDisconnect:
         pass

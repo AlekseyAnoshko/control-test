@@ -32,19 +32,66 @@
   .badge { padding:.2rem .5rem; border-radius:6px; font-size:.85rem; }
   .badge.uploaded { background:#14532d; color:#4ade80; }
   .badge.missing { background:#450a0a; color:#f87171; }
+  .connection-card { background:#fff; color:#151515; box-shadow:none; }
+  .connection-layout { display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+  .qr-button { background:#fff; color:#151515; border:1px solid #d5d8d1; padding:12px; margin:0; }
+  .qr-button:hover { background:#f3f5ef; }
+  .qr-button img { display:block; width:180px; height:180px; max-width:100%; }
+  .qr-caption { display:block; margin-top:8px; font-size:13px; }
+  .connection-details { flex:1; min-width:210px; overflow-wrap:anywhere; }
+  .connection-details p { line-height:1.6; }
+  .student-address { color:#151515; font-weight:600; font-size:18px; }
+  .qr-dialog { box-sizing:border-box; width:min(92vw,760px); max-height:94vh; overflow:auto; border:0; border-radius:16px; padding:24px; background:#fff; color:#151515; text-align:center; }
+  .qr-dialog::backdrop { background:rgba(0,0,0,.7); }
+  .qr-dialog img { display:block; width:min(100%,520px); height:auto; margin:0 auto; }
+  .qr-dialog button { background:#181818; color:#fff; }
+  .qr-dialog p { overflow-wrap:anywhere; }
+  @media(max-width:480px) { body { padding:1rem; } .connection-layout { justify-content:center; } .connection-details { min-width:0; width:100%; flex-basis:100%; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Панель преподавателя</h1>
 
+  <section class="card connection-card" aria-labelledby="connectionHeading">
+    <h2 id="connectionHeading">Подключение студентов</h2>
+    <div class="connection-layout">
+      <button type="button" class="qr-button" id="enlargeWifiQr" aria-label="Увеличить QR-код подключения к Wi-Fi">
+        <img id="wifiQrImage" src="/static/control-test-wifi-qr.png" alt="QR-код подключения к Wi-Fi control-test с паролем" width="180" height="180">
+        <span class="qr-caption">Нажмите, чтобы увеличить</span>
+      </button>
+      <div class="connection-details">
+        <p><strong>1. Подключитесь к Wi-Fi control-test.</strong><br>Отсканируйте QR-код камерой телефона. Пароль уже включён.</p>
+        <p><strong>2. Откройте страницу тестирования.</strong><br><a class="student-address" href="http://10.10.10.1:8000/" target="_blank" rel="noopener">http://10.10.10.1:8000/</a></p>
+        <p id="wifiQrMissing" role="status" hidden>QR-код не найден. Сохраните изображение как app/static/control-test-wifi-qr.png на ноутбуке и обновите страницу.</p>
+      </div>
+    </div>
+  </section>
+
+  <dialog class="qr-dialog" id="wifiQrDialog" aria-labelledby="wifiQrHeading">
+    <h2 id="wifiQrHeading">Подключитесь к Wi-Fi control-test</h2>
+    <img src="/static/control-test-wifi-qr.png" alt="Увеличенный QR-код подключения к Wi-Fi control-test" width="520" height="520">
+    <p>После подключения откройте<br><a class="student-address" href="http://10.10.10.1:8000/" target="_blank" rel="noopener">http://10.10.10.1:8000/</a></p>
+    <form method="dialog"><button type="submit">Закрыть</button></form>
+  </dialog>
+
   <div class="card">
     <h2>Тест (формат GIFT)</h2>
-    <input type="file" id="giftFile" accept=".gift,.txt" />
+    <label for="giftFile">Файл теста (.gift или .txt)</label>
+    <input type="file" id="giftFile" accept=".gift,.txt" aria-describedby="uploadMessage" />
+    <p id="uploadMessage" role="status" style="line-height:1.5;">Выберите файл, затем нажмите «Загрузить тест».</p>
     <button id="uploadBtn">Загрузить тест</button>
     <div id="uploadStatus" style="margin-top:.5rem;">
       <span class="badge missing" id="questionsBadge">Тест не загружен</span>
     </div>
+  </div>
+
+  <div class="card">
+    <label for="questionSeconds">Время на один вопрос, секунд</label>
+    <input type="number" id="questionSeconds" min="1" max="3600" step="1" value="60" />
+    <button id="saveQuestionSeconds">Сохранить время</button>
+    <p style="line-height:1.5;">Вопросы меняются автоматически. Без ответа по истечении времени — неправильно. Время можно менять до начала теста.</p>
+    <div id="teacherTimer" role="timer" style="font-size:1.2rem; font-variant-numeric:tabular-nums;"></div>
   </div>
 
   <div class="card">
@@ -73,9 +120,11 @@
   <div class="card">
     <h2>Результаты</h2>
     <button id="refreshResultsBtn" class="secondary">Обновить результаты</button>
+    <button id="exportReportBtn" disabled>Выгрузить отчёт DOCX</button>
+    <p id="reportStatus" role="status">Отчёт станет доступен после завершения теста.</p>
     <table id="resultsTable">
       <thead>
-        <tr><th>Студент</th><th>Отвечено</th><th>Правильно</th></tr>
+        <tr><th>Студент</th><th>Отвечено</th><th>Правильно</th><th>Неправильно / без ответа</th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -83,6 +132,20 @@
 </div>
 
 <script>
+const wifiQrDialog = document.getElementById('wifiQrDialog');
+const wifiQrImage = document.getElementById('wifiQrImage');
+const enlargeWifiQr = document.getElementById('enlargeWifiQr');
+function showMissingQr() {
+  enlargeWifiQr.hidden = true;
+  document.getElementById('wifiQrMissing').hidden = false;
+}
+wifiQrImage.addEventListener('error', showMissingQr);
+if (wifiQrImage.complete && wifiQrImage.naturalWidth === 0) showMissingQr();
+enlargeWifiQr.addEventListener('click', () => {
+  if (typeof wifiQrDialog.showModal === 'function') wifiQrDialog.showModal();
+  else window.open(wifiQrImage.src, '_blank', 'noopener');
+});
+
 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
 const ws = new WebSocket(`${proto}://${location.host}/ws/teacher`);
 
@@ -95,9 +158,38 @@ const studentList = document.getElementById('studentList');
 const questionsBadge = document.getElementById('questionsBadge');
 const questionInfo = document.getElementById('questionInfo');
 
+const secondsInput = document.getElementById('questionSeconds');
+const secondsBtn = document.getElementById('saveQuestionSeconds');
+let secondsDirty = false;
+let reportReady = false;
+let reportBusy = false;
+let teacherDeadline = null;
+let currentQuestionIndex = -1;
+secondsInput.addEventListener('input', () => { secondsDirty = true; });
+secondsBtn.addEventListener('click', () => {
+  if (!secondsInput.reportValidity() || ws.readyState !== WebSocket.OPEN) return;
+  secondsDirty = false;
+  ws.send(JSON.stringify({type: 'set_question_seconds', value: Number(secondsInput.value)}));
+});
+setInterval(() => {
+  if (teacherDeadline !== null) {
+    document.getElementById('teacherTimer').textContent = `До следующего вопроса: ${Math.max(0, Math.ceil((teacherDeadline - performance.now()) / 1000))} с`;
+  }
+}, 200);
+
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
   if (data.type === 'status') {
+    currentQuestionIndex = data.current_index;
+    reportReady = Boolean(data.test_finished);
+    document.getElementById('exportReportBtn').disabled = !reportReady || reportBusy;
+    document.getElementById('reportStatus').textContent = data.test_finished ? `Отчёт готов: ${data.test_filename || 'Тест.gift'}` : 'Отчёт станет доступен после завершения теста.';
+    secondsInput.disabled = data.test_started;
+    secondsBtn.disabled = data.test_started;
+    if (!secondsDirty || data.test_started) secondsInput.value = data.question_seconds;
+    if (data.test_started) secondsDirty = false;
+    teacherDeadline = data.test_started && typeof data.remaining_seconds === 'number' ? performance.now() + data.remaining_seconds * 1000 : null;
+    if (teacherDeadline === null) document.getElementById('teacherTimer').textContent = data.test_finished ? 'Тест завершён' : `На каждый вопрос: ${data.question_seconds} с`;
     connectedEl.textContent = data.connected;
     expectedEl.textContent = data.expected;
     const ready = data.expected > 0 && data.connected >= data.expected;
@@ -108,7 +200,7 @@ ws.onmessage = (event) => {
 
     readinessEl.textContent = data.test_started
       ? `Тест запущен, вопрос ${data.current_index + 1} из ${data.questions_loaded}`
-      : (ready ? 'Все студенты подключены — можно начинать' : 'Ожидание подключения студентов…');
+      : (data.test_finished ? 'Тест завершён' : (ready ? 'Все студенты подключены — можно начинать' : 'Ожидание подключения студентов…'));
     readinessEl.className = data.test_started ? 'ready' : (ready ? 'ready' : 'notready');
 
     if (hasQuestions) {
@@ -130,22 +222,47 @@ ws.onmessage = (event) => {
   }
 };
 
-document.getElementById('uploadBtn').addEventListener('click', async () => {
-  const fileInput = document.getElementById('giftFile');
+const fileInput = document.getElementById('giftFile');
+const uploadBtn = document.getElementById('uploadBtn');
+const uploadMessage = document.getElementById('uploadMessage');
+let uploadAfterSelection = false;
+
+async function uploadSelectedTest() {
   if (!fileInput.files.length) {
-    alert('Выберите файл теста в формате GIFT');
+    uploadAfterSelection = true;
+    fileInput.click();
     return;
   }
-  const formData = new FormData();
-  formData.append('file', fileInput.files[0]);
-  const resp = await fetch('/api/upload_test', { method: 'POST', body: formData });
-  const result = await resp.json();
-  if (result.ok) {
-    alert(`Загружено вопросов: ${result.count}`);
-  } else {
-    alert(`Ошибка: ${result.error}`);
+  uploadBtn.disabled = true;
+  fileInput.disabled = true;
+  uploadMessage.textContent = 'Загружаем и проверяем файл…';
+  try {
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]);
+    const resp = await fetch('/api/upload_test', { method: 'POST', body: formData });
+    const result = await resp.json();
+    if (!resp.ok || !result.ok) {
+      throw new Error(result.error || 'Не удалось загрузить файл');
+    }
+    uploadMessage.textContent = `Тест загружен. Вопросов: ${result.count}.`;
+    questionsBadge.textContent = `Загружено вопросов: ${result.count}`;
+    questionsBadge.className = 'badge uploaded';
+  } catch (error) {
+    uploadMessage.textContent = `Ошибка загрузки: ${error.message}. Проверьте файл и повторите попытку.`;
+  } finally {
+    uploadBtn.disabled = false;
+    fileInput.disabled = false;
+  }
+}
+
+uploadBtn.addEventListener('click', uploadSelectedTest);
+fileInput.addEventListener('change', () => {
+  if (uploadAfterSelection && fileInput.files.length) {
+    uploadAfterSelection = false;
+    uploadSelectedTest();
   }
 });
+fileInput.addEventListener('cancel', () => { uploadAfterSelection = false; });
 
 document.getElementById('setBtn').addEventListener('click', () => {
   const value = parseInt(document.getElementById('expectedInput').value, 10) || 0;
@@ -153,17 +270,19 @@ document.getElementById('setBtn').addEventListener('click', () => {
 });
 
 startBtn.addEventListener('click', () => {
-  ws.send(JSON.stringify({type: 'start_test', force: false}));
+  if (!secondsInput.reportValidity()) return;
+  ws.send(JSON.stringify({type: 'start_test', force: false, question_seconds: Number(secondsInput.value)}));
 });
 
 document.getElementById('forceBtn').addEventListener('click', () => {
   if (confirm('Начать тест, даже если не все студенты подключились?')) {
-    ws.send(JSON.stringify({type: 'start_test', force: true}));
+    if (!secondsInput.reportValidity()) return;
+    ws.send(JSON.stringify({type: 'start_test', force: true, question_seconds: Number(secondsInput.value)}));
   }
 });
 
 nextBtn.addEventListener('click', () => {
-  ws.send(JSON.stringify({type: 'next_question'}));
+  ws.send(JSON.stringify({type: 'next_question', current_index: currentQuestionIndex}));
 });
 
 document.getElementById('resetBtn').addEventListener('click', () => {
@@ -179,12 +298,46 @@ async function loadResults() {
   tbody.innerHTML = '';
   data.results.forEach((r) => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${r.name}</td><td>${r.answered}/${data.total_questions}</td><td>${r.correct}</td>`;
+    for (const value of [r.name, `${r.answered}/${data.total_questions}`, r.correct, r.incorrect]) {
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.appendChild(td);
+    }
     tbody.appendChild(tr);
   });
 }
 
 document.getElementById('refreshResultsBtn').addEventListener('click', loadResults);
+document.getElementById('exportReportBtn').addEventListener('click', async () => {
+  const button = document.getElementById('exportReportBtn');
+  const message = document.getElementById('reportStatus');
+  button.disabled = true;
+  reportBusy = true;
+  message.textContent = 'Готовим отчёт…';
+  try {
+    const response = await fetch('/api/results/report.docx');
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Не удалось сформировать отчёт');
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const name = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = name ? decodeURIComponent(name[1]) : 'Отчёт.docx';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 30000);
+    message.textContent = 'Отчёт сформирован. Файл передан браузеру для скачивания.';
+  } catch (error) {
+    message.textContent = `Ошибка: ${error.message}`;
+  } finally {
+    reportBusy = false;
+    button.disabled = !reportReady;
+  }
+});
 </script>
 </body>
 </html>

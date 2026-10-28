@@ -1,0 +1,10 @@
+{
+  "ap_interface": "wlx00127b21755b",
+  "wan_interface": "wlp3s0",
+  "address": "10.10.10.1/24",
+  "dhcp_start": "10.10.10.100",
+  "dhcp_end": "10.10.10.250",
+  "mode": "block-ai",
+  "web_port": 8000,
+  "dns_servers": ["1.1.1.1", "8.8.8.8"]
+}
