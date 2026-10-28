@@ -120,6 +120,8 @@
   <div class="card">
     <h2>Результаты</h2>
     <button id="refreshResultsBtn" class="secondary">Обновить результаты</button>
+    <button id="exportReportBtn" disabled>Выгрузить отчёт DOCX</button>
+    <p id="reportStatus" role="status">Отчёт станет доступен после завершения теста.</p>
     <table id="resultsTable">
       <thead>
         <tr><th>Студент</th><th>Отвечено</th><th>Правильно</th><th>Неправильно / без ответа</th></tr>
@@ -159,6 +161,8 @@ const questionInfo = document.getElementById('questionInfo');
 const secondsInput = document.getElementById('questionSeconds');
 const secondsBtn = document.getElementById('saveQuestionSeconds');
 let secondsDirty = false;
+let reportReady = false;
+let reportBusy = false;
 let teacherDeadline = null;
 let currentQuestionIndex = -1;
 secondsInput.addEventListener('input', () => { secondsDirty = true; });
@@ -177,6 +181,9 @@ ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
   if (data.type === 'status') {
     currentQuestionIndex = data.current_index;
+    reportReady = Boolean(data.test_finished);
+    document.getElementById('exportReportBtn').disabled = !reportReady || reportBusy;
+    document.getElementById('reportStatus').textContent = data.test_finished ? `Отчёт готов: ${data.test_filename || 'Тест.gift'}` : 'Отчёт станет доступен после завершения теста.';
     secondsInput.disabled = data.test_started;
     secondsBtn.disabled = data.test_started;
     if (!secondsDirty || data.test_started) secondsInput.value = data.question_seconds;
@@ -301,6 +308,36 @@ async function loadResults() {
 }
 
 document.getElementById('refreshResultsBtn').addEventListener('click', loadResults);
+document.getElementById('exportReportBtn').addEventListener('click', async () => {
+  const button = document.getElementById('exportReportBtn');
+  const message = document.getElementById('reportStatus');
+  button.disabled = true;
+  reportBusy = true;
+  message.textContent = 'Готовим отчёт…';
+  try {
+    const response = await fetch('/api/results/report.docx');
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Не удалось сформировать отчёт');
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const name = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = name ? decodeURIComponent(name[1]) : 'Отчёт.docx';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 30000);
+    message.textContent = 'Отчёт сформирован. Файл передан браузеру для скачивания.';
+  } catch (error) {
+    message.textContent = `Ошибка: ${error.message}`;
+  } finally {
+    reportBusy = false;
+    button.disabled = !reportReady;
+  }
+});
 </script>
 </body>
 </html>

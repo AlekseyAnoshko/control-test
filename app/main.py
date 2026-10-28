@@ -21,12 +21,16 @@ import asyncio
 import re
 import uuid
 import time
+from datetime import datetime, timezone
+from urllib.parse import quote
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
+from app.report import build_report, upload_name
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -176,6 +180,10 @@ class AppState:
         self.test_finished: bool = False
         self.questions: list[Question] = []
         self.current_index: int = -1
+        self.test_filename: str = ""
+        self.started_at: datetime | None = None
+        self.finished_at: datetime | None = None
+        self.participant_ids: set[str] = set()
         self.question_seconds: int = 60
         self.deadline: float | None = None
         self.timer_task: asyncio.Task | None = None
@@ -202,6 +210,7 @@ async def notify_teachers() -> None:
         "test_started": state.test_started,
         "test_finished": state.test_finished,
         "questions_loaded": len(state.questions),
+        "test_filename": state.test_filename,
         "current_index": state.current_index,
         **timer_payload(),
         "students": [s["name"] for s in state.students.values() if s.get("ws") is not None],
@@ -271,6 +280,7 @@ async def advance_question_locked() -> None:
         cancel_question_timer()
         state.test_started = False
         state.test_finished = True
+        state.finished_at = datetime.now(timezone.utc)
         for info in tuple(state.students.values()):
             if info.get("ws") is not None:
                 try:
@@ -318,6 +328,9 @@ async def upload_test(file: UploadFile = File(...)):
             return JSONResponse({"ok": False, "error": "Сначала завершите текущий тест"}, status_code=409)
         cancel_question_timer()
         state.questions = questions
+        state.test_filename = upload_name(file.filename)
+        state.started_at = state.finished_at = None
+        state.participant_ids = set()
         state.test_finished = False
         state.current_index = -1
         state.answers = {}
@@ -347,6 +360,32 @@ async def get_results():
     return {"results": rows, "total_questions": len(state.questions)}
 
 
+@app.get("/api/results/report.docx")
+async def download_report():
+    async with state.lock:
+        if not state.test_finished:
+            return JSONResponse({"ok": False, "error": "Отчёт доступен после завершения тестирования"}, status_code=409)
+        total = len(state.questions)
+        rows = []
+        for sid, info in state.students.items():
+            if sid not in state.participant_ids:
+                continue
+            answers = state.answers.get(sid, {})
+            answered = sum(q.id in answers for q in state.questions)
+            correct = sum(q.id in answers and q.check(answers[q.id]) for q in state.questions)
+            rows.append({"name": info["name"], "answered": answered, "correct": correct,
+                         "incorrect": total - correct, "unanswered": total - answered,
+                         "percent": 100 * correct / total if total else 0})
+        snapshot = {"test_filename": state.test_filename or "Тест.gift", "started_at": state.started_at,
+                    "finished_at": state.finished_at, "question_seconds": state.question_seconds,
+                    "total_questions": total, "students": rows}
+    content = await run_in_threadpool(build_report, snapshot)
+    filename = "Отчёт " + Path(snapshot["test_filename"]).stem + ".docx"
+    return Response(content, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": "attachment; filename=report.docx; filename*=UTF-8''" + quote(filename, safe=''),
+                             "Cache-Control": "no-store"})
+
+
 # ---------------------------------------------------------------------------
 # WebSocket: студент
 # ---------------------------------------------------------------------------
@@ -361,6 +400,8 @@ async def ws_student(websocket: WebSocket, name: str = "Студент", student
         previous = state.students.get(student_id, {}).get("ws")
         state.students[student_id] = {"name": name, "ws": websocket}
         state.answers.setdefault(student_id, {})
+        if state.test_started:
+            state.participant_ids.add(student_id)
     if previous is not None:
         await previous.close(code=4001)
     await notify_teachers()
@@ -472,6 +513,9 @@ async def ws_teacher(websocket: WebSocket):
                         state.test_started = True
                         state.test_finished = False
                         state.current_index = 0
+                        state.started_at = datetime.now(timezone.utc)
+                        state.finished_at = None
+                        state.participant_ids = {sid for sid, info in state.students.items() if info.get("ws") is not None}
                         state.answers = {}
                         schedule_question_timer()
                         await broadcast_question(state.questions[0])
@@ -494,6 +538,9 @@ async def ws_teacher(websocket: WebSocket):
                     state.test_finished = False
                     state.expected = 0
                     state.questions = []
+                    state.test_filename = ""
+                    state.started_at = state.finished_at = None
+                    state.participant_ids = set()
                     state.current_index = -1
                     state.answers = {}
                     for info in tuple(state.students.values()):
