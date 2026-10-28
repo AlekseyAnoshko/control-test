@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File
@@ -29,8 +30,10 @@ from fastapi.templating import Jinja2Templates
 
 app = FastAPI(title="Control Test")
 
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
-templates = Jinja2Templates(directory="app/templates")
+APP_DIR = Path(__file__).resolve().parent
+if (APP_DIR / "static").is_dir():
+    app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=APP_DIR / "templates")
 
 
 # ---------------------------------------------------------------------------
