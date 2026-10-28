@@ -40,7 +40,9 @@
 
   <div class="card">
     <h2>Тест (формат GIFT)</h2>
-    <input type="file" id="giftFile" accept=".gift,.txt" />
+    <label for="giftFile">Файл теста (.gift или .txt)</label>
+    <input type="file" id="giftFile" accept=".gift,.txt" aria-describedby="uploadMessage" />
+    <p id="uploadMessage" role="status" style="line-height:1.5;">Выберите файл, затем нажмите «Загрузить тест».</p>
     <button id="uploadBtn">Загрузить тест</button>
     <div id="uploadStatus" style="margin-top:.5rem;">
       <span class="badge missing" id="questionsBadge">Тест не загружен</span>
@@ -130,22 +132,47 @@ ws.onmessage = (event) => {
   }
 };
 
-document.getElementById('uploadBtn').addEventListener('click', async () => {
-  const fileInput = document.getElementById('giftFile');
+const fileInput = document.getElementById('giftFile');
+const uploadBtn = document.getElementById('uploadBtn');
+const uploadMessage = document.getElementById('uploadMessage');
+let uploadAfterSelection = false;
+
+async function uploadSelectedTest() {
   if (!fileInput.files.length) {
-    alert('Выберите файл теста в формате GIFT');
+    uploadAfterSelection = true;
+    fileInput.click();
     return;
   }
-  const formData = new FormData();
-  formData.append('file', fileInput.files[0]);
-  const resp = await fetch('/api/upload_test', { method: 'POST', body: formData });
-  const result = await resp.json();
-  if (result.ok) {
-    alert(`Загружено вопросов: ${result.count}`);
-  } else {
-    alert(`Ошибка: ${result.error}`);
+  uploadBtn.disabled = true;
+  fileInput.disabled = true;
+  uploadMessage.textContent = 'Загружаем и проверяем файл…';
+  try {
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]);
+    const resp = await fetch('/api/upload_test', { method: 'POST', body: formData });
+    const result = await resp.json();
+    if (!resp.ok || !result.ok) {
+      throw new Error(result.error || 'Не удалось загрузить файл');
+    }
+    uploadMessage.textContent = `Тест загружен. Вопросов: ${result.count}.`;
+    questionsBadge.textContent = `Загружено вопросов: ${result.count}`;
+    questionsBadge.className = 'badge uploaded';
+  } catch (error) {
+    uploadMessage.textContent = `Ошибка загрузки: ${error.message}. Проверьте файл и повторите попытку.`;
+  } finally {
+    uploadBtn.disabled = false;
+    fileInput.disabled = false;
+  }
+}
+
+uploadBtn.addEventListener('click', uploadSelectedTest);
+fileInput.addEventListener('change', () => {
+  if (uploadAfterSelection && fileInput.files.length) {
+    uploadAfterSelection = false;
+    uploadSelectedTest();
   }
 });
+fileInput.addEventListener('cancel', () => { uploadAfterSelection = false; });
 
 document.getElementById('setBtn').addEventListener('click', () => {
   const value = parseInt(document.getElementById('expectedInput').value, 10) || 0;
