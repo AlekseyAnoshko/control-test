@@ -32,11 +32,48 @@
   .badge { padding:.2rem .5rem; border-radius:6px; font-size:.85rem; }
   .badge.uploaded { background:#14532d; color:#4ade80; }
   .badge.missing { background:#450a0a; color:#f87171; }
+  .connection-card { background:#fff; color:#151515; box-shadow:none; }
+  .connection-layout { display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+  .qr-button { background:#fff; color:#151515; border:1px solid #d5d8d1; padding:12px; margin:0; }
+  .qr-button:hover { background:#f3f5ef; }
+  .qr-button img { display:block; width:180px; height:180px; max-width:100%; }
+  .qr-caption { display:block; margin-top:8px; font-size:13px; }
+  .connection-details { flex:1; min-width:210px; overflow-wrap:anywhere; }
+  .connection-details p { line-height:1.6; }
+  .student-address { color:#151515; font-weight:600; font-size:18px; }
+  .qr-dialog { box-sizing:border-box; width:min(92vw,760px); max-height:94vh; overflow:auto; border:0; border-radius:16px; padding:24px; background:#fff; color:#151515; text-align:center; }
+  .qr-dialog::backdrop { background:rgba(0,0,0,.7); }
+  .qr-dialog img { display:block; width:min(100%,520px); height:auto; margin:0 auto; }
+  .qr-dialog button { background:#181818; color:#fff; }
+  .qr-dialog p { overflow-wrap:anywhere; }
+  @media(max-width:480px) { body { padding:1rem; } .connection-layout { justify-content:center; } .connection-details { min-width:0; width:100%; flex-basis:100%; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Панель преподавателя</h1>
+
+  <section class="card connection-card" aria-labelledby="connectionHeading">
+    <h2 id="connectionHeading">Подключение студентов</h2>
+    <div class="connection-layout">
+      <button type="button" class="qr-button" id="enlargeWifiQr" aria-label="Увеличить QR-код подключения к Wi-Fi">
+        <img id="wifiQrImage" src="/static/control-test-wifi-qr.png" alt="QR-код подключения к Wi-Fi control-test с паролем" width="180" height="180">
+        <span class="qr-caption">Нажмите, чтобы увеличить</span>
+      </button>
+      <div class="connection-details">
+        <p><strong>1. Подключитесь к Wi-Fi control-test.</strong><br>Отсканируйте QR-код камерой телефона. Пароль уже включён.</p>
+        <p><strong>2. Откройте страницу тестирования.</strong><br><a class="student-address" href="http://10.10.10.1:8000/" target="_blank" rel="noopener">http://10.10.10.1:8000/</a></p>
+        <p id="wifiQrMissing" role="status" hidden>QR-код не найден. Сохраните изображение как app/static/control-test-wifi-qr.png на ноутбуке и обновите страницу.</p>
+      </div>
+    </div>
+  </section>
+
+  <dialog class="qr-dialog" id="wifiQrDialog" aria-labelledby="wifiQrHeading">
+    <h2 id="wifiQrHeading">Подключитесь к Wi-Fi control-test</h2>
+    <img src="/static/control-test-wifi-qr.png" alt="Увеличенный QR-код подключения к Wi-Fi control-test" width="520" height="520">
+    <p>После подключения откройте<br><a class="student-address" href="http://10.10.10.1:8000/" target="_blank" rel="noopener">http://10.10.10.1:8000/</a></p>
+    <form method="dialog"><button type="submit">Закрыть</button></form>
+  </dialog>
 
   <div class="card">
     <h2>Тест (формат GIFT)</h2>
@@ -85,6 +122,20 @@
 </div>
 
 <script>
+const wifiQrDialog = document.getElementById('wifiQrDialog');
+const wifiQrImage = document.getElementById('wifiQrImage');
+const enlargeWifiQr = document.getElementById('enlargeWifiQr');
+function showMissingQr() {
+  enlargeWifiQr.hidden = true;
+  document.getElementById('wifiQrMissing').hidden = false;
+}
+wifiQrImage.addEventListener('error', showMissingQr);
+if (wifiQrImage.complete && wifiQrImage.naturalWidth === 0) showMissingQr();
+enlargeWifiQr.addEventListener('click', () => {
+  if (typeof wifiQrDialog.showModal === 'function') wifiQrDialog.showModal();
+  else window.open(wifiQrImage.src, '_blank', 'noopener');
+});
+
 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
 const ws = new WebSocket(`${proto}://${location.host}/ws/teacher`);
 

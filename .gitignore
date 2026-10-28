@@ -178,3 +178,6 @@ cython_debug/
 # Local gateway configuration and generated output
 /gateway.json
 /build/
+
+# Local Wi-Fi QR contains credentials; keep it off GitHub.
+/app/static/control-test-wifi-qr.png
