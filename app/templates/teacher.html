@@ -87,6 +87,14 @@
   </div>
 
   <div class="card">
+    <label for="questionSeconds">Время на один вопрос, секунд</label>
+    <input type="number" id="questionSeconds" min="1" max="3600" step="1" value="60" />
+    <button id="saveQuestionSeconds">Сохранить время</button>
+    <p style="line-height:1.5;">Вопросы меняются автоматически. Без ответа по истечении времени — неправильно. Время можно менять до начала теста.</p>
+    <div id="teacherTimer" role="timer" style="font-size:1.2rem; font-variant-numeric:tabular-nums;"></div>
+  </div>
+
+  <div class="card">
     <label for="expectedInput">Количество студентов в аудитории</label>
     <input type="number" id="expectedInput" min="0" value="0" />
     <button id="setBtn">Задать</button>
@@ -114,7 +122,7 @@
     <button id="refreshResultsBtn" class="secondary">Обновить результаты</button>
     <table id="resultsTable">
       <thead>
-        <tr><th>Студент</th><th>Отвечено</th><th>Правильно</th></tr>
+        <tr><th>Студент</th><th>Отвечено</th><th>Правильно</th><th>Неправильно / без ответа</th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -148,9 +156,33 @@ const studentList = document.getElementById('studentList');
 const questionsBadge = document.getElementById('questionsBadge');
 const questionInfo = document.getElementById('questionInfo');
 
+const secondsInput = document.getElementById('questionSeconds');
+const secondsBtn = document.getElementById('saveQuestionSeconds');
+let secondsDirty = false;
+let teacherDeadline = null;
+let currentQuestionIndex = -1;
+secondsInput.addEventListener('input', () => { secondsDirty = true; });
+secondsBtn.addEventListener('click', () => {
+  if (!secondsInput.reportValidity() || ws.readyState !== WebSocket.OPEN) return;
+  secondsDirty = false;
+  ws.send(JSON.stringify({type: 'set_question_seconds', value: Number(secondsInput.value)}));
+});
+setInterval(() => {
+  if (teacherDeadline !== null) {
+    document.getElementById('teacherTimer').textContent = `До следующего вопроса: ${Math.max(0, Math.ceil((teacherDeadline - performance.now()) / 1000))} с`;
+  }
+}, 200);
+
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
   if (data.type === 'status') {
+    currentQuestionIndex = data.current_index;
+    secondsInput.disabled = data.test_started;
+    secondsBtn.disabled = data.test_started;
+    if (!secondsDirty || data.test_started) secondsInput.value = data.question_seconds;
+    if (data.test_started) secondsDirty = false;
+    teacherDeadline = data.test_started && typeof data.remaining_seconds === 'number' ? performance.now() + data.remaining_seconds * 1000 : null;
+    if (teacherDeadline === null) document.getElementById('teacherTimer').textContent = data.test_finished ? 'Тест завершён' : `На каждый вопрос: ${data.question_seconds} с`;
     connectedEl.textContent = data.connected;
     expectedEl.textContent = data.expected;
     const ready = data.expected > 0 && data.connected >= data.expected;
@@ -161,7 +193,7 @@ ws.onmessage = (event) => {
 
     readinessEl.textContent = data.test_started
       ? `Тест запущен, вопрос ${data.current_index + 1} из ${data.questions_loaded}`
-      : (ready ? 'Все студенты подключены — можно начинать' : 'Ожидание подключения студентов…');
+      : (data.test_finished ? 'Тест завершён' : (ready ? 'Все студенты подключены — можно начинать' : 'Ожидание подключения студентов…'));
     readinessEl.className = data.test_started ? 'ready' : (ready ? 'ready' : 'notready');
 
     if (hasQuestions) {
@@ -231,17 +263,19 @@ document.getElementById('setBtn').addEventListener('click', () => {
 });
 
 startBtn.addEventListener('click', () => {
-  ws.send(JSON.stringify({type: 'start_test', force: false}));
+  if (!secondsInput.reportValidity()) return;
+  ws.send(JSON.stringify({type: 'start_test', force: false, question_seconds: Number(secondsInput.value)}));
 });
 
 document.getElementById('forceBtn').addEventListener('click', () => {
   if (confirm('Начать тест, даже если не все студенты подключились?')) {
-    ws.send(JSON.stringify({type: 'start_test', force: true}));
+    if (!secondsInput.reportValidity()) return;
+    ws.send(JSON.stringify({type: 'start_test', force: true, question_seconds: Number(secondsInput.value)}));
   }
 });
 
 nextBtn.addEventListener('click', () => {
-  ws.send(JSON.stringify({type: 'next_question'}));
+  ws.send(JSON.stringify({type: 'next_question', current_index: currentQuestionIndex}));
 });
 
 document.getElementById('resetBtn').addEventListener('click', () => {
@@ -257,7 +291,11 @@ async function loadResults() {
   tbody.innerHTML = '';
   data.results.forEach((r) => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${r.name}</td><td>${r.answered}/${data.total_questions}</td><td>${r.correct}</td>`;
+    for (const value of [r.name, `${r.answered}/${data.total_questions}`, r.correct, r.incorrect]) {
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.appendChild(td);
+    }
     tbody.appendChild(tr);
   });
 }

@@ -2,6 +2,7 @@
   'use strict';
   const $ = id => document.getElementById(id);
   let socket, reconnectTimer, ackTimer, retryDelay = 1000;
+  let questionDeadline = null;
   let current = null, accepted = false, pending = false, finished = false, changingName = false;
   let name = sessionStorage.getItem('student_name') || '';
   let studentId = sessionStorage.getItem('student_id') || '';
@@ -21,6 +22,7 @@
     $('pageDescription').textContent = description;
   }
   function showWaiting() {
+    questionDeadline = null;
     current = null; pending = false; accepted = false; finished = false;
     clearTimeout(ackTimer);
     panels('statePanel');
@@ -32,6 +34,7 @@
     $('sideCard').dataset.active = 'false';
   }
   function showFinished() {
+    questionDeadline = null;
     current = null; pending = false; accepted = false; finished = true;
     clearTimeout(ackTimer);
     panels('statePanel');
@@ -53,13 +56,29 @@
   function updateSubmit() {
     const answer = value();
     const empty = answer === null || answer === '' || (Array.isArray(answer) && !answer.length);
-    $('sendBtn').disabled = !current || empty || accepted || pending || socket?.readyState !== WebSocket.OPEN;
+    $('sendBtn').disabled = !current || (questionDeadline !== null && performance.now() >= questionDeadline) || empty || accepted || pending || socket?.readyState !== WebSocket.OPEN;
   }
+  function updateCountdown() {
+    if (!current || questionDeadline === null) {
+      $('questionTimer').textContent = '';
+      return;
+    }
+    const seconds = Math.max(0, Math.ceil((questionDeadline - performance.now()) / 1000));
+    $('questionTimer').textContent = `Осталось: ${seconds} с`;
+    $('questionTimer').dataset.urgent = String(seconds <= 10);
+    if (seconds === 0 && !accepted) {
+      $('answers').disabled = true;
+      $('answerStatus').textContent = pending ? 'Время вышло. Проверяем подтверждение ответа…' : 'Время вышло. Ответ не отправлен — вопрос засчитывается как неправильный.';
+      $('sendBtn').disabled = true;
+    }
+  }
+  setInterval(updateCountdown, 200);
   function showQuestion(data) {
     const same = current?.id === data.question.id;
     const draft = same ? value() : null;
     clearTimeout(ackTimer);
     current = data.question; pending = false; accepted = Boolean(data.answered); finished = false;
+    questionDeadline = typeof data.remaining_seconds === 'number' ? performance.now() + data.remaining_seconds * 1000 : null;
     panels('questionPanel');
     title('Время подумать', 'Прочитайте вопрос и отправьте свой ответ.');
     $('sideCard').dataset.active = 'true';
@@ -97,6 +116,7 @@
     $('answerStatus').dataset.tone = '';
     $('answerStatus').textContent = accepted ? 'Ответ сохранён. Ждём следующий вопрос.' : 'Выберите ответ, затем нажмите кнопку.';
     $('sendBtn').textContent = accepted ? 'Ответ сохранён' : 'Отправить ответ';
+    updateCountdown();
     updateSubmit();
     if (!same) $('questionTitle').focus();
   }
@@ -135,6 +155,7 @@
         $('answerStatus').textContent = 'Ответ сохранён. Ждём следующий вопрос.';
         $('sendBtn').textContent = 'Ответ сохранён'; updateSubmit();
       } else if (data.type === 'error') {
+        if (data.question_id && data.question_id !== current?.id) return;
         clearTimeout(ackTimer); pending = false;
         $('answerStatus').textContent = data.message;
         $('answerStatus').dataset.tone = 'error';
