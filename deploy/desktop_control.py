@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Desktop controls for the current user's Control Test web service."""
 import json
+import os
+from pathlib import Path
+import signal
+import socket
 import shutil
 import subprocess
 import sys
@@ -22,10 +26,65 @@ def message(text, error=False):
         subprocess.run(['notify-send', 'Control Test', text], check=False)
 
 
+def server_reachable():
+    try:
+        with socket.create_connection(('10.10.10.1', 8000), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def manual_server_pids(project):
+    """Only our user's explicit uvicorn invocation in this service's project."""
+    if not project:
+        return []
+    found = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            if (entry / 'cwd').resolve() != Path(project).resolve():
+                continue
+            args = (entry / 'cmdline').read_bytes().decode().strip('\0').split('\0')
+            # Accept python -m uvicorn and the venv's uvicorn console script.
+            is_uvicorn = (len(args) > 3 and args[1:3] == ['-m', 'uvicorn']
+                          and args[3] == 'app.main:app') or (
+                          len(args) > 2 and Path(args[1]).name == 'uvicorn'
+                          and args[2] == 'app.main:app')
+            def option(name):
+                return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
+            if is_uvicorn and option('--port') == '8000' and option('--host') in ('10.10.10.1', '0.0.0.0'):
+                found.append(int(entry.name))
+        except (OSError, ValueError, UnicodeError):
+            continue
+    return found
+
+
+def stop_server():
+    result = subprocess.run(
+        ['systemctl', '--user', 'show', UNIT, '--property=WorkingDirectory', '--value'],
+        check=True, capture_output=True, text=True)
+    project = result.stdout.strip()
+    subprocess.run(['systemctl', '--user', 'stop', UNIT], check=True)
+    for pid in manual_server_pids(project):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 15
+    while server_reachable():
+        if time.monotonic() >= deadline:
+            raise RuntimeError('Порт 10.10.10.1:8000 всё ещё доступен. Возможно, работает другой экземпляр сервера. '
+                               'Проверьте: ss -ltnp sport = :8000. Остановка не подтверждена.')
+        time.sleep(0.2)
+    message('Тестирование остановлено. Порт сервера закрыт. Открытая страница может оставаться в браузере до обновления.')
+
+
 def control(action):
     if action == 'stop':
-        subprocess.run(['systemctl', '--user', 'stop', UNIT], check=True)
-        message('Тестирование остановлено. Сервер больше не принимает подключения.')
+        stop_server()
         return
     if action != 'start':
         raise ValueError('Expected start or stop')
