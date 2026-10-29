@@ -170,6 +170,10 @@
       $('sendBtn').textContent = accepted ? 'Ответ сохранён' : 'Отправить ответ';
       connection('offline', 'Нет связи');
       $('joinBtn').disabled = false; $('nameInput').disabled = false;
+      if (event.code === 4403) {
+        location.reload(); // Show the server's timed Wi-Fi access denial page.
+        return;
+      }
       if (event.code === 4001) {
         $('offlineBanner').querySelector('p').textContent = 'Тест открыт в другой вкладке. Закройте её перед повторным подключением.';
         return;

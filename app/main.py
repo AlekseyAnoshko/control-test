@@ -31,12 +31,17 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from app.report import build_report, upload_name
+from app import wifi_access
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 @asynccontextmanager
 async def lifespan(app):
+    wifi_task = asyncio.create_task(enforce_wifi_access())
     yield
+    wifi_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await wifi_task
     task = state.timer_task
     if task is not None:
         task.cancel()
@@ -45,6 +50,8 @@ async def lifespan(app):
 
 
 app = FastAPI(title="Control Test", lifespan=lifespan)
+
+app.add_middleware(wifi_access.WifiAccessMiddleware)
 
 APP_DIR = Path(__file__).resolve().parent
 if (APP_DIR / "static").is_dir():
@@ -304,6 +311,31 @@ async def teacher_page(request: Request):
     return templates.TemplateResponse(request, "teacher.html", {})
 
 
+@app.get('/students', response_class=HTMLResponse)
+async def students_page(request: Request):
+    return templates.TemplateResponse(request, 'students.html', {})
+
+
+@app.get('/api/students')
+async def students_status():
+    return JSONResponse(wifi_access.students(), headers={'Cache-Control': 'no-store'})
+
+
+async def enforce_wifi_access():
+    while True:
+        await asyncio.sleep(1)
+        try:
+            for info in tuple(state.students.values()):
+                ws = info.get('ws')
+                if ws is not None:
+                    wifi_access.remember(info.get('ip', ''), info.get('name', ''))
+                    if wifi_access.blocked(info.get('ip', '')):
+                        await ws.close(code=4403, reason='Wi-Fi disconnected; site blocked for 10 minutes')
+        except (OSError, RuntimeError):
+            # A vanished socket or temporarily unavailable snapshot must not stop the monitor task.
+            continue
+
+
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(request: Request):
     return templates.TemplateResponse(request, "student.html", {})
@@ -398,7 +430,9 @@ async def ws_student(websocket: WebSocket, name: str = "Студент", student
         if student_id not in state.students:
             student_id = str(uuid.uuid4())
         previous = state.students.get(student_id, {}).get("ws")
-        state.students[student_id] = {"name": name, "ws": websocket}
+        client_ip = websocket.client.host if websocket.client else ''
+        mac = wifi_access.remember(client_ip, name)
+        state.students[student_id] = {"name": name, "ws": websocket, "ip": client_ip, "mac": mac}
         state.answers.setdefault(student_id, {})
         if state.test_started:
             state.participant_ids.add(student_id)
@@ -423,6 +457,9 @@ async def ws_student(websocket: WebSocket, name: str = "Студент", student
     try:
         while True:
             msg = await websocket.receive_json()
+            if wifi_access.blocked(websocket.client.host if websocket.client else ''):
+                await websocket.close(code=4403)
+                break
             if not isinstance(msg, dict):
                 continue
             if msg.get("type") == "ping":
