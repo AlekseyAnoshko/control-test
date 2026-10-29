@@ -26,3 +26,8 @@ api.z.ai
 gigachat.devices.sberbank.ru
 giga.chat
 alice.yandex.ru
+# Kimi / Moonshot AI
+kimi.com
+kimi.ai
+moonshot.cn
+moonshot.ai
