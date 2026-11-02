@@ -31,9 +31,10 @@ class ReportTests(unittest.TestCase):
                     first = student.receive_json()
                     student.send_json({'type': 'answer', 'question_id': first['question']['id'], 'value': [0]})
                     self.assertEqual(student.receive_json()['type'], 'answer_saved')
-                    teacher.send_json({'type': 'next_question', 'current_index': 0})
-                    self.assertEqual(student.receive_json()['type'], 'question')
-                    teacher.send_json({'type': 'next_question', 'current_index': 1})
+                    second = student.receive_json()
+                    self.assertEqual(second['type'], 'question')
+                    main.state.progress[sid]['deadline'] = main.time.monotonic() - 1
+                    client.portal.call(main.schedule_question_timer)
                     self.assertEqual(student.receive_json()['type'], 'finished')
             self.assertIsNone(main.state.students[sid]['ws'])
             response = client.get('/api/results/report.docx')

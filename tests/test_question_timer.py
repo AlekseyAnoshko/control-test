@@ -1,6 +1,6 @@
 import asyncio
+import time
 import unittest
-
 from fastapi.testclient import TestClient
 from app import main
 
@@ -8,90 +8,60 @@ from app import main
 class QuestionTimerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         main.state = main.AppState()
-        main.state.questions = main.parse_gift('::Первый::Один? {=Да ~Нет}\n\n::Второй::Два? {TRUE}')
+        main.state.questions = main.parse_gift('::First::One? {=Yes ~No}\n\n::Second::Two? {TRUE}')
         main.state.test_started = True
-        main.state.current_index = 0
         main.state.question_seconds = 1
-        main.state.students['sid'] = {'name': 'Алексей', 'ws': None}
-        main.state.answers['sid'] = {}
+        main.state.students['offline'] = {'name': 'Offline', 'ws': None}
+        main.state.progress['offline'] = {'index': 0, 'deadline': time.monotonic() + .02}
 
     async def asyncTearDown(self):
         task = main.state.timer_task
         main.cancel_question_timer()
-        if task is not None:
+        if task:
             await asyncio.gather(task, return_exceptions=True)
 
-    async def test_server_advances_without_clients_and_counts_missing_as_wrong(self):
-        async with main.state.lock:
-            main.schedule_question_timer()
+    async def test_offline_student_times_out_and_test_finishes(self):
+        main.schedule_question_timer()
         async def finished():
             while not main.state.test_finished:
                 await asyncio.sleep(.02)
-        await asyncio.wait_for(finished(), timeout=3)
-        self.assertEqual(main.state.current_index, 1)
-        self.assertFalse(main.state.test_started)
-        self.assertIsNone(main.state.timer_task)
+        await asyncio.wait_for(finished(), 2)
         row = (await main.get_results())['results'][0]
-        self.assertEqual((row['correct'], row['incorrect'], row['unanswered']), (0, 2, 2))
+        self.assertEqual((row['correct'], row['unanswered']), (0, 2))
 
-    async def test_cancelled_generation_cannot_advance_next_question(self):
-        async with main.state.lock:
-            main.schedule_question_timer()
-            old_generation = main.state.timer_generation
-            old_deadline = main.state.deadline
-            await main.advance_question_locked()
-        self.assertEqual(main.state.current_index, 1)
-        # Simulate a stale expiry waking after a manual transition.
-        stale = asyncio.create_task(main.expire_question(main.state, old_generation, old_deadline))
-        await stale
-        self.assertEqual(main.state.current_index, 1)
+    async def test_delayed_callback_counts_all_elapsed_questions(self):
+        main.state.progress['offline']['deadline'] = time.monotonic() - 3
+        await main.expire_question(main.state, main.state.timer_generation, time.monotonic())
+        self.assertTrue(main.state.test_finished)
 
-    async def test_reset_cancels_timer(self):
-        main.schedule_question_timer()
-        task = main.state.timer_task
+    async def test_answer_changes_only_own_progress_and_deadline(self):
+        second_deadline = time.monotonic() + 40
+        main.state.progress['other'] = {'index': 0, 'deadline': second_deadline}
+        main.state.students['other'] = {'name': 'Other', 'ws': None}
+        await main.advance_student_locked('offline')
+        self.assertEqual(main.state.progress['offline']['index'], 1)
+        self.assertEqual(main.state.progress['other'], {'index': 0, 'deadline': second_deadline})
+        self.assertFalse(main.state.test_finished)
+
+    async def test_cancelled_generation_cannot_advance(self):
+        generation = main.state.timer_generation
         main.cancel_question_timer()
-        main.state.test_started = False
-        main.state.current_index = -1
-        main.state.questions = []
-        await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(main.state.current_index, -1)
-        self.assertIsNone(main.state.deadline)
+        await main.expire_question(main.state, generation, time.monotonic())
+        self.assertEqual(main.state.progress['offline']['index'], 0)
 
 
-class TimerProtocolTests(unittest.TestCase):
-    def setUp(self):
+class TimedStartTests(unittest.TestCase):
+    def test_server_starts_personal_timer_and_finishes(self):
         main.state = main.AppState()
-        main.state.questions = main.parse_gift('::Вопрос::Ответ? {=Да ~Нет}')
-
-    def test_deadline_rejects_answer_even_before_expiry_callback(self):
-        main.state.test_started = True
-        main.state.current_index = 0
-        main.state.deadline = main.time.monotonic() - 1
+        main.state.questions = main.parse_gift('::One::One? {TRUE}')
         with TestClient(main.app) as client:
-            with client.websocket_connect('/ws/student') as ws:
-                ws.receive_json()
-                payload = ws.receive_json()
-                self.assertEqual(payload['remaining_seconds'], 0)
-                ws.send_json({'type': 'answer', 'question_id': main.state.questions[0].id, 'value': [0]})
-                self.assertEqual(ws.receive_json()['type'], 'error')
-                self.assertEqual(client.get('/api/results').json()['results'][0]['correct'], 0)
-
-    def test_config_validation_and_timed_start(self):
-        with TestClient(main.app) as client:
-            with client.websocket_connect('/ws/teacher') as teacher:
-                teacher.receive_json()
-                for value in (0, -1, 3601, 1.5, True, '10'):
-                    teacher.send_json({'type': 'set_question_seconds', 'value': value})
-                    self.assertEqual(teacher.receive_json()['type'], 'error')
-                    self.assertEqual(teacher.receive_json()['question_seconds'], 60)
-                teacher.send_json({'type': 'set_question_seconds', 'value': 1})
-                self.assertEqual(teacher.receive_json()['question_seconds'], 1)
-                with client.websocket_connect('/ws/student') as student:
-                    teacher.receive_json()  # participant joined
-                    student.receive_json()
-                    teacher.send_json({'type': 'start_test', 'force': True})
+            with client.websocket_connect('/ws/student') as student:
+                sid = student.receive_json()['student_id']
+                with client.websocket_connect('/ws/teacher') as teacher:
+                    teacher.receive_json()
+                    teacher.send_json({'type': 'start_test', 'force': True, 'question_seconds': 1})
                     question = student.receive_json()
-                    self.assertEqual(question['question_seconds'], 1)
                     self.assertGreater(question['remaining_seconds'], 0)
-                    self.assertLessEqual(question['remaining_seconds'], 1)
                     self.assertEqual(student.receive_json()['type'], 'finished')
+                    self.assertEqual(main.state.progress[sid]['index'], 1)
+                    self.assertTrue(main.state.test_finished)

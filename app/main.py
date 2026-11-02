@@ -183,6 +183,7 @@ def parse_gift(text: str) -> list[Question]:
 
 class AppState:
     def __init__(self) -> None:
+        self.progress: dict[str, dict] = {}
         self.expected: int = 0
         self.test_started: bool = False
         self.test_finished: bool = False
@@ -214,6 +215,7 @@ def reset_participants():
     # Keep students waiting in the current lobby; remove disconnected old sessions.
     state.students = {sid: info for sid, info in state.students.items() if info.get('ws') is not None}
     state.answers = {}
+    state.progress = {}
     state.participant_ids = set()
     wifi_access.reset_session()
     for info in state.students.values():
@@ -230,6 +232,7 @@ async def notify_teachers() -> None:
         "questions_loaded": len(state.questions),
         "test_filename": state.test_filename,
         "current_index": state.current_index,
+        "finished_students": sum(p["index"] >= len(state.questions) for p in state.progress.values()),
         **timer_payload(),
         "students": [s["name"] for s in state.students.values() if s.get("ws") is not None],
     }
@@ -243,24 +246,27 @@ async def notify_teachers() -> None:
         state.teacher_sockets.discard(ws)
 
 
-async def broadcast_question(question: Question) -> None:
-    payload = {"type": "question", "index": state.current_index,
-               "total": len(state.questions), "question": question.to_public_dict(), **timer_payload()}
-    dead_ids = []
-    for sid, info in tuple(state.students.items()):
-        if info.get("ws") is None:
-            continue
-        try:
-            await info["ws"].send_json(payload)
-        except Exception:
-            dead_ids.append(sid)
-    for sid in dead_ids:
-        state.students[sid]["ws"] = None
+async def send_student_question(sid):
+    progress = state.progress.get(sid)
+    ws = state.students.get(sid, {}).get('ws')
+    if progress is None or ws is None:
+        return
+    try:
+        index = progress['index']
+        if index >= len(state.questions):
+            await ws.send_json({'type': 'finished'})
+        else:
+            await ws.send_json({'type': 'question', 'index': index,
+                               'total': len(state.questions),
+                               'question': state.questions[index].to_public_dict(),
+                               'question_seconds': state.question_seconds,
+                               'remaining_seconds': max(0, progress['deadline'] - time.monotonic())})
+    except Exception:
+        state.students[sid]['ws'] = None
 
 
 def timer_payload() -> dict:
-    return {"question_seconds": state.question_seconds,
-            "remaining_seconds": max(0, state.deadline - time.monotonic()) if state.deadline is not None else None}
+    return {'question_seconds': state.question_seconds, 'remaining_seconds': None}
 
 
 def cancel_question_timer() -> None:
@@ -273,10 +279,11 @@ def cancel_question_timer() -> None:
 
 
 def schedule_question_timer() -> None:
-    # Called while holding state.lock; generation prevents an old timer from advancing a new question.
     cancel_question_timer()
-    state.deadline = time.monotonic() + state.question_seconds
-    state.timer_task = asyncio.create_task(expire_question(state, state.timer_generation, state.deadline))
+    deadlines = [p['deadline'] for p in state.progress.values() if p['index'] < len(state.questions)]
+    if deadlines:
+        state.deadline = min(deadlines)
+        state.timer_task = asyncio.create_task(expire_question(state, state.timer_generation, state.deadline))
 
 
 async def expire_question(owner: AppState, generation: int, deadline: float) -> None:
@@ -284,27 +291,35 @@ async def expire_question(owner: AppState, generation: int, deadline: float) -> 
     async with owner.lock:
         if owner is not state or generation != owner.timer_generation or not owner.test_started:
             return
-        await advance_question_locked()
+        now = time.monotonic()
+        for sid, progress in tuple(state.progress.items()):
+            changed = False
+            while progress['index'] < len(state.questions) and progress['deadline'] <= now:
+                progress['index'] += 1
+                progress['deadline'] += state.question_seconds
+                changed = True
+            if changed:
+                await send_student_question(sid)
+        finish_or_schedule()
+        await notify_teachers()
 
 
-async def advance_question_locked() -> None:
-    if not state.test_started:
-        return
-    if state.current_index + 1 < len(state.questions):
-        state.current_index += 1
-        schedule_question_timer()
-        await broadcast_question(state.questions[state.current_index])
-    else:
+def finish_or_schedule():
+    if state.progress and all(p['index'] >= len(state.questions) for p in state.progress.values()):
         cancel_question_timer()
         state.test_started = False
         state.test_finished = True
         state.finished_at = datetime.now(timezone.utc)
-        for info in tuple(state.students.values()):
-            if info.get("ws") is not None:
-                try:
-                    await info["ws"].send_json({"type": "finished"})
-                except Exception:
-                    info["ws"] = None
+    else:
+        schedule_question_timer()
+
+
+async def advance_student_locked(sid):
+    progress = state.progress[sid]
+    progress['index'] += 1
+    progress['deadline'] = time.monotonic() + state.question_seconds
+    await send_student_question(sid)
+    finish_or_schedule()
     await notify_teachers()
 
 
@@ -448,6 +463,9 @@ async def ws_student(websocket: WebSocket, name: str = "Студент", student
         state.answers.setdefault(student_id, {})
         if state.test_started:
             state.participant_ids.add(student_id)
+            if student_id not in state.progress:
+                state.progress[student_id] = {'index': 0, 'deadline': time.monotonic() + state.question_seconds}
+                schedule_question_timer()
     if previous is not None:
         await previous.close(code=4001)
     await notify_teachers()
@@ -455,17 +473,11 @@ async def ws_student(websocket: WebSocket, name: str = "Студент", student
         "type": "joined", "student_id": student_id,
         "test_started": state.test_started, "test_finished": state.test_finished,
     })
-    if state.test_finished:
-        await websocket.send_json({"type": "finished"})
-    elif state.test_started and 0 <= state.current_index < len(state.questions):
-        question = state.questions[state.current_index]
-        saved = state.answers[student_id]
-        await websocket.send_json({
-            "type": "question", "index": state.current_index, "total": len(state.questions),
-            "question": question.to_public_dict(),
-            "answered": question.id in saved, "answer": saved.get(question.id),
-            **timer_payload(),
-        })
+    async with state.lock:
+        if state.test_finished:
+            await websocket.send_json({'type': 'finished'})
+        elif state.test_started:
+            await send_student_question(student_id)
     try:
         while True:
             msg = await websocket.receive_json()
@@ -481,9 +493,11 @@ async def ws_student(websocket: WebSocket, name: str = "Студент", student
                 async with state.lock:
                     if state.students[student_id].get("ws") is not websocket:
                         break
-                    question = state.questions[state.current_index] if state.test_started and 0 <= state.current_index < len(state.questions) else None
+                    progress = state.progress.get(student_id, {})
+                    index = progress.get('index', -1)
+                    question = state.questions[index] if state.test_started and 0 <= index < len(state.questions) else None
                     valid = (question is not None and qid == question.id
-                             and (state.deadline is None or time.monotonic() < state.deadline))
+                             and time.monotonic() < progress['deadline'])
                     if valid and question.qtype == "short_answer":
                         valid = isinstance(value, str) and 0 < len(value.strip()) <= 2000
                         if valid:
@@ -496,11 +510,12 @@ async def ws_student(websocket: WebSocket, name: str = "Студент", student
                                  and len(set(value)) == len(value))
                     if valid:
                         state.answers.setdefault(student_id, {}).setdefault(qid, value)
+                        await websocket.send_json({'type': 'answer_saved', 'question_id': qid})
+                        await advance_student_locked(student_id)
                 if not valid:
                     await websocket.send_json({"type": "error", "question_id": qid, "message": "Ответ не принят: время вышло, вопрос сменился или ответ не заполнен."})
                     continue
-                await websocket.send_json({"type": "answer_saved", "question_id": qid})
-                await notify_teachers()
+
     except WebSocketDisconnect:
         pass
     finally:
@@ -567,19 +582,15 @@ async def ws_teacher(websocket: WebSocket):
                         state.finished_at = None
                         state.participant_ids = {sid for sid, info in state.students.items() if info.get("ws") is not None}
                         state.answers = {}
+                        deadline = time.monotonic() + state.question_seconds
+                        state.progress = {sid: {'index': 0, 'deadline': deadline} for sid in state.participant_ids}
                         schedule_question_timer()
-                        await broadcast_question(state.questions[0])
+                        for sid in state.participant_ids:
+                            await send_student_question(sid)
                         await notify_teachers()
                     else:
                         message = "Сначала загрузите тест (GIFT-файл)" if not state.questions else "Не все студенты подключились"
                         await websocket.send_json({"type": "error", "message": message})
-
-            elif action == "next_question":
-                async with state.lock:
-                    # If expiry already moved the class, do not skip another question.
-                    expected_index = data.get("current_index", state.current_index)
-                    if expected_index == state.current_index:
-                        await advance_question_locked()
 
             elif action == "reset":
                 async with state.lock:
