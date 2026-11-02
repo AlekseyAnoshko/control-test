@@ -148,7 +148,8 @@ enlargeWifiQr.addEventListener('click', () => {
 });
 
 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-const ws = new WebSocket(`${proto}://${location.host}/ws/teacher`);
+let ws;
+let reconnectTimer;
 
 const connectedEl = document.getElementById('connectedCount');
 const expectedEl = document.getElementById('expectedCount');
@@ -178,7 +179,7 @@ setInterval(() => {
   }
 }, 200);
 
-ws.onmessage = (event) => {
+function handleStatus(event) {
   const data = JSON.parse(event.data);
   if (data.type === 'status') {
     currentQuestionIndex = data.current_index;
@@ -212,6 +213,7 @@ ws.onmessage = (event) => {
       questionsBadge.className = 'badge missing';
     }
 
+    loadResults().catch(() => {});
     studentList.innerHTML = '';
     data.students.forEach((name) => {
       const li = document.createElement('li');
@@ -222,6 +224,23 @@ ws.onmessage = (event) => {
     alert(data.message);
   }
 };
+
+function connectTeacher() {
+  clearTimeout(reconnectTimer);
+  ws = new WebSocket(`${proto}://${location.host}/ws/teacher`);
+  ws.onmessage = handleStatus;
+  ws.onclose = () => {
+    startBtn.disabled = true;
+    nextBtn.disabled = true;
+    readinessEl.textContent = 'Нет связи с сервером. Переподключаемся…';
+    reconnectTimer = setTimeout(connectTeacher, 1500);
+  };
+  ws.onerror = () => ws.close();
+}
+connectTeacher();
+window.addEventListener('online', () => {
+  if (ws.readyState === WebSocket.CLOSED) connectTeacher();
+});
 
 const fileInput = document.getElementById('giftFile');
 const uploadBtn = document.getElementById('uploadBtn');
@@ -293,7 +312,7 @@ document.getElementById('resetBtn').addEventListener('click', () => {
 });
 
 async function loadResults() {
-  const resp = await fetch('/api/results');
+  const resp = await fetch('/api/results', {cache: 'no-store'});
   const data = await resp.json();
   const tbody = document.querySelector('#resultsTable tbody');
   tbody.innerHTML = '';
@@ -309,6 +328,9 @@ async function loadResults() {
 }
 
 document.getElementById('refreshResultsBtn').addEventListener('click', loadResults);
+setInterval(() => {
+  if (!document.hidden) loadResults().catch(() => {});
+}, 3000);
 document.getElementById('exportReportBtn').addEventListener('click', async () => {
   const button = document.getElementById('exportReportBtn');
   const message = document.getElementById('reportStatus');

@@ -38,6 +38,12 @@ def database():
         db.close()
 
 
+def reset_session():
+    """Forget registrations and penalties belonging to the previous test session."""
+    with database() as db:
+        db.execute('DELETE FROM devices')
+
+
 def registered():
     with database() as db:
         return {mac: {'first_seen': first_seen, 'name': name}
@@ -85,6 +91,8 @@ def students():
     rows = []
     for row in data['stations']:
         registration = devices.get(row['mac'])
+        if registration is None and not row.get('connected'):
+            continue
         seconds = remaining(row, registration)
         rows.append({**row, 'name': registration['name'] if registration else '',
                      'registered': registration is not None, 'remaining_seconds': seconds,

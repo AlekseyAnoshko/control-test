@@ -78,6 +78,36 @@ class AccessTests(unittest.TestCase):
         self.row = {'mac': MAC, 'ip': IP, 'connected': True, **fields}
         self.path.write_text(json.dumps({'updated_at': time.time(), 'healthy': True, 'stations': [self.row]}))
 
+    def test_new_session_forgets_old_names_and_penalties(self):
+        wifi_access.remember(IP, 'Previous student')
+        self.write_status(connected=False, blocked_at=time.time() + 1,
+                          blocked_until=time.time() + 601)
+        self.assertEqual(len(wifi_access.students()['stations']), 1)
+        wifi_access.reset_session()
+        self.assertEqual(wifi_access.students()['stations'], [])
+        self.assertEqual(wifi_access.blocked(IP), 0)
+        self.write_status(connected=True)
+        current = wifi_access.students()['stations'][0]
+        self.assertEqual(current['name'], '')
+        self.assertFalse(current['registered'])
+
+    def test_new_test_keeps_lobby_but_removes_disconnected_students(self):
+        with patch.object(main, 'state', main.AppState()):
+            main.state.students = {
+                'old': {'name': 'Old', 'ws': None},
+                'current': {'name': 'Current', 'ws': object(), 'ip': IP}}
+            main.state.answers = {'old': {'q': 'answer'}}
+            wifi_access.remember(IP, 'Old')
+            main.reset_participants()
+            self.assertEqual(set(main.state.students), {'current'})
+            self.assertEqual(main.state.answers, {})
+            self.assertEqual(wifi_access.registered()[MAC]['name'], 'Current')
+
+    def test_service_start_clears_previous_registration(self):
+        wifi_access.remember(IP, 'Old')
+        with TestClient(main.app):
+            self.assertEqual(wifi_access.registered(), {})
+
     def test_real_wifi_break_denies_http_and_ws_then_expires(self):
         now = time.time()
         with TestClient(main.app, client=(IP, 1234)) as client:

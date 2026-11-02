@@ -37,6 +37,7 @@ from fastapi.templating import Jinja2Templates
 
 @asynccontextmanager
 async def lifespan(app):
+    wifi_access.reset_session()
     wifi_task = asyncio.create_task(enforce_wifi_access())
     yield
     wifi_task.cancel()
@@ -209,6 +210,16 @@ class AppState:
 state = AppState()
 
 
+def reset_participants():
+    # Keep students waiting in the current lobby; remove disconnected old sessions.
+    state.students = {sid: info for sid, info in state.students.items() if info.get('ws') is not None}
+    state.answers = {}
+    state.participant_ids = set()
+    wifi_access.reset_session()
+    for info in state.students.values():
+        wifi_access.remember(info.get('ip', ''), info.get('name', ''))
+
+
 async def notify_teachers() -> None:
     payload = {
         "type": "status",
@@ -359,6 +370,7 @@ async def upload_test(file: UploadFile = File(...)):
         if state.test_started:
             return JSONResponse({"ok": False, "error": "Сначала завершите текущий тест"}, status_code=409)
         cancel_question_timer()
+        reset_participants()
         state.questions = questions
         state.test_filename = upload_name(file.filename)
         state.started_at = state.finished_at = None
@@ -547,6 +559,7 @@ async def ws_teacher(websocket: WebSocket):
                     force = bool(data.get("force", False))
                     ready = state.connected_count() >= state.expected and state.expected > 0
                     if (ready or force) and state.questions:
+                        reset_participants()
                         state.test_started = True
                         state.test_finished = False
                         state.current_index = 0
@@ -571,6 +584,7 @@ async def ws_teacher(websocket: WebSocket):
             elif action == "reset":
                 async with state.lock:
                     cancel_question_timer()
+                    reset_participants()
                     state.test_started = False
                     state.test_finished = False
                     state.expected = 0
