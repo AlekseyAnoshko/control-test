@@ -7,7 +7,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-STATUS_PATH = Path('/run/control-test-wifi/status.json')
+STATUS_PATH = Path(os.environ.get('CONTROL_TEST_STATUS', '/run/control-test-wifi/status.json'))
 DB_PATH = Path(os.environ.get('CONTROL_TEST_WIFI_DB',
                str(Path.home() / '.local/state/control-test/wifi.sqlite3')))
 
