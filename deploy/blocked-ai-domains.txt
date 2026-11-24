@@ -31,3 +31,5 @@ kimi.com
 kimi.ai
 moonshot.cn
 moonshot.ai
+deepseek.ai
+deepseek.cn

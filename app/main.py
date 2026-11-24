@@ -32,7 +32,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from app.report import build_report, upload_name
-from app import wifi_access
+from app import wifi_access, ai_warning
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -54,6 +54,7 @@ async def lifespan(app):
 app = FastAPI(title="Control Test", lifespan=lifespan)
 
 app.add_middleware(wifi_access.WifiAccessMiddleware)
+app.add_middleware(ai_warning.AIWarningMiddleware)
 
 APP_DIR = Path(__file__).resolve().parent
 if (APP_DIR / "static").is_dir():
@@ -382,6 +383,11 @@ async def advance_student_locked(sid):
 # ---------------------------------------------------------------------------
 # HTTP-маршруты
 # ---------------------------------------------------------------------------
+
+@app.get('/ai-blocked', response_class=HTMLResponse)
+async def ai_blocked_page():
+    return ai_warning.response()
+
 
 @app.get("/", response_class=HTMLResponse)
 async def join_page(request: Request):
