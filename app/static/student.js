@@ -48,6 +48,10 @@
   }
   function value() {
     if (!current) return null;
+    if (current.type === 'matching') {
+      const selections = [...$('options').querySelectorAll('select')];
+      return selections.some(input => input.value === '') ? null : selections.map(input => Number(input.value));
+    }
     if (current.type === 'short_answer') return $('shortAnswerInput').value.trim();
     const inputs = [...$('options').querySelectorAll('input:checked')];
     if (current.type === 'true_false') return inputs.length ? current.answers[Number(inputs[0].value)] : null;
@@ -93,7 +97,20 @@
     $('questionText').hidden = current.title === current.text;
     $('options').replaceChildren();
     const saved = accepted ? data.answer : draft;
-    if (current.type === 'short_answer') {
+    if (current.type === 'matching') {
+      $('questionType').textContent = 'Соответствие';
+      $('answerHint').textContent = 'Выберите соответствие для каждого пункта';
+      current.answers.forEach((text, index) => {
+        const label = document.createElement('label'); label.className = 'option';
+        const caption = document.createElement('span'); caption.className = 'option-text'; caption.textContent = text;
+        const select = document.createElement('select'); select.className = 'text-input';
+        select.setAttribute('aria-label', text);
+        select.add(new Option('Выберите…', ''));
+        current.matching_choices.forEach((choice, value) => select.add(new Option(choice, String(value))));
+        if (Array.isArray(saved) && Number.isInteger(saved[index])) select.value = String(saved[index]);
+        label.append(caption, select); $('options').append(label);
+      });
+    } else if (current.type === 'short_answer') {
       $('answerHint').textContent = 'Введите свой ответ';
       const input = document.createElement('input');
       input.className = 'text-input'; input.id = 'shortAnswerInput'; input.type = 'text'; input.maxLength = 2000;
@@ -193,6 +210,7 @@
     connect();
   });
   $('options').addEventListener('input', updateSubmit);
+  $('options').addEventListener('change', updateSubmit);
   $('answerForm').addEventListener('submit', event => {
     event.preventDefault();
     updateSubmit();

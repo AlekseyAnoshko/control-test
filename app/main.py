@@ -18,6 +18,7 @@ Control-test: сервис для проведения тестирования 
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal, InvalidOperation
 import re
 import uuid
 import time
@@ -77,18 +78,35 @@ class Question:
     text: str
     qtype: str  # "multiple_choice" | "true_false" | "short_answer"
     answers: list[Answer] = field(default_factory=list)
+    numeric_answers: list[tuple[str, str]] = field(default_factory=list)
+
+    def matching_choices(self):
+        return sorted({a.text.split(' -> ', 1)[1] for a in self.answers})
 
     def to_public_dict(self) -> dict:
         return {
             "id": self.id,
             "title": self.title,
             "text": self.text,
-            "type": self.qtype,
+            "type": "short_answer" if self.qtype == "numerical" else self.qtype,
             "multiple": self.qtype == "multiple_choice" and sum(a.correct for a in self.answers) > 1,
-            "answers": [a.text for a in self.answers] if self.qtype != "short_answer" else [],
+            "answers": ([a.text.split(' -> ', 1)[0] for a in self.answers] if self.qtype == 'matching'
+                        else [a.text for a in self.answers] if self.qtype == 'multiple_choice' or self.qtype == 'true_false' else []),
+            "matching_choices": self.matching_choices() if self.qtype == 'matching' else [],
         }
 
     def check(self, given) -> bool:
+        if self.qtype == 'numerical':
+            try:
+                number = Decimal(str(given).strip().replace(',', '.'))
+                return number.is_finite() and any(abs(number - Decimal(n)) <= Decimal(t)
+                                                  for n, t in self.numeric_answers)
+            except (InvalidOperation, ValueError):
+                return False
+        if self.qtype == 'matching':
+            choices = self.matching_choices()
+            expected = [choices.index(a.text.split(' -> ', 1)[1]) for a in self.answers]
+            return given == expected
         if self.qtype == "short_answer":
             given_norm = str(given).strip().lower()
             correct_texts = {a.text.strip().lower() for a in self.answers if a.correct}
@@ -118,6 +136,10 @@ def _split_blocks(text: str) -> list[str]:
     return [b.strip() for b in raw_blocks if b.strip()]
 
 
+def gift_unescape(text):
+    return re.sub(r'\\([~=#{}:])', r'\1', text)
+
+
 def _parse_block(block: str) -> Question | None:
     title = ""
     body = block
@@ -145,27 +167,61 @@ def _parse_block(block: str) -> Question | None:
         return Question(id=qid, title=title, text=question_text, qtype="true_false",
                          answers=[Answer("TRUE", False), Answer("FALSE", True)])
 
-    parts = re.split(r"(?=[=~])", answer_block)
-    parts = [p.strip() for p in parts if p.strip()]
+    if answer_block.startswith('#'):
+        numeric = []
+        for part in answer_block[1:].split('='):
+            part = part.strip()
+            if not part:
+                continue
+            part = re.split(r'(?<!\\)#', part, maxsplit=1)[0].strip()
+            weight = re.match(r'^%([+-]?\d+(?:\.\d+)?)%', part)
+            if weight:
+                if Decimal(weight[1]) <= 0:
+                    continue
+                part = part[weight.end():]
+            number, _, tolerance = part.partition(':')
+            try:
+                n, t = Decimal(number.strip()), Decimal(tolerance.strip() or '0')
+                if not n.is_finite() or not t.is_finite() or t < 0:
+                    raise ValueError()
+                numeric.append((str(n), str(t)))
+            except (InvalidOperation, ValueError):
+                raise ValueError(f'{title}: неподдерживаемый числовой ответ')
+        if not numeric:
+            raise ValueError(f'{title}: нет числового ответа')
+        return Question(id=qid, title=title, text=gift_unescape(question_text),
+                        qtype='numerical', numeric_answers=numeric)
 
-    answers: list[Answer] = []
+    # Escaped delimiters belong to answer text, e.g. \~/.ssh/known_hosts.
+    parts = re.split(r'(?<!\\)(?=[=~])', answer_block)
+    answers = []
+    markers = []
     for part in parts:
-        if part.startswith("="):
-            clean = re.sub(r"^=(%-?\d+%)?", "", part).strip()
-            clean = re.sub(r"#.*$", "", clean).strip()
-            answers.append(Answer(clean, True))
-        elif part.startswith("~"):
-            clean = re.sub(r"^~(%-?\d+%)?", "", part).strip()
-            clean = re.sub(r"#.*$", "", clean).strip()
-            answers.append(Answer(clean, False))
+        part = part.strip()
+        if not part or part[0] not in '=~':
+            continue
+        marker, clean = part[0], part[1:]
+        weight = re.match(r'^%([+-]?\d+(?:\.\d+)?)%', clean)
+        correct = marker == '='
+        if weight:
+            correct = Decimal(weight[1]) > 0
+            clean = clean[weight.end():]
+        clean = re.split(r'(?<!\\)#', clean, maxsplit=1)[0].strip()
+        answers.append(Answer(gift_unescape(clean), correct))
+        markers.append(marker)
 
-    if not answers:
-        return None
+    if not answers or not any(a.correct for a in answers):
+        raise ValueError(f'{title}: не найдены правильные ответы')
 
-    if len(answers) == 1 and answers[0].correct:
-        return Question(id=qid, title=title, text=question_text, qtype="short_answer", answers=answers)
-
-    return Question(id=qid, title=title, text=question_text, qtype="multiple_choice", answers=answers)
+    all_equal = all(marker == '=' for marker in markers)
+    if all_equal and all(' -> ' in a.text for a in answers):
+        qtype = 'matching'
+    elif all_equal:
+        # Several =answers without ~alternatives mean accepted short-answer synonyms.
+        qtype = 'short_answer'
+    else:
+        qtype = 'multiple_choice'
+    return Question(id=qid, title=title, text=gift_unescape(question_text), qtype=qtype, answers=answers)
 
 
 def parse_gift(text: str) -> list[Question]:
@@ -377,7 +433,10 @@ async def upload_test(file: UploadFile = File(...)):
     if state.test_started:
         return JSONResponse({"ok": False, "error": "Сначала завершите текущий тест"}, status_code=409)
     content = (await file.read()).decode("utf-8", errors="replace")
-    questions = parse_gift(content)
+    try:
+        questions = parse_gift(content)
+    except ValueError as exc:
+        return JSONResponse({'ok': False, 'error': str(exc)}, status_code=400)
     if not questions:
         return JSONResponse({"ok": False, "error": "Не удалось распознать вопросы в файле"}, status_code=400)
 
@@ -498,10 +557,13 @@ async def ws_student(websocket: WebSocket, name: str = "Студент", student
                     question = state.questions[index] if state.test_started and 0 <= index < len(state.questions) else None
                     valid = (question is not None and qid == question.id
                              and time.monotonic() < progress['deadline'])
-                    if valid and question.qtype == "short_answer":
+                    if valid and question.qtype in ("short_answer", "numerical"):
                         valid = isinstance(value, str) and 0 < len(value.strip()) <= 2000
                         if valid:
                             value = value.strip()
+                    elif valid and question.qtype == 'matching':
+                        valid = (isinstance(value, list) and len(value) == len(question.answers)
+                                 and all(type(v) is int and 0 <= v < len(question.matching_choices()) for v in value))
                     elif valid and question.qtype == "true_false":
                         valid = isinstance(value, str) and value in ("TRUE", "FALSE")
                     elif valid:
