@@ -8,24 +8,37 @@
 </style></head><body><main>
 <a href="/teacher">← Панель преподавателя</a>
 <h1>Подключения студентов</h1>
-<p>После разрыва Wi-Fi вход на сайт закрывается на 10 минут. Обновление страницы и закрытие браузера не вызывают блокировку. Сам Wi-Fi остаётся доступен.</p>
+<p>Во время тестирования после разрыва Wi-Fi вход на сайт закрывается на 10 минут. До запуска и после завершения теста штрафы не применяются. Обновление страницы и закрытие браузера не вызывают блокировку. Сам Wi-Fi остаётся доступен.</p>
 <div class="panel" id="monitor" role="status">Проверяем службу контроля Wi-Fi…</div>
 <section class="panel"><div id="summary">Загружаем список…</div><p class="muted">Список обновляется каждые 2 секунды. Имя появляется после входа студента в тест. Устройство без имени ещё не зарегистрировано на сайте.</p>
-<div class="scroll"><table><thead><tr><th>Студент / устройство</th><th>IP</th><th>MAC</th><th>Wi-Fi</th><th>Доступ к сайту</th></tr></thead><tbody id="rows"></tbody></table></div>
+<p><button id="reset-all" type="button" disabled>Обнулить все штрафы</button></p>
+<p id="reset-message" role="status" aria-live="polite"></p>
+<div class="scroll"><table><thead><tr><th>Студент / устройство</th><th>IP</th><th>MAC</th><th>Wi-Fi</th><th>Доступ к сайту</th><th>Штраф</th></tr></thead><tbody id="rows"></tbody></table></div>
 <p id="empty" hidden>Подключений пока нет. Подключите телефон к control-test и откройте страницу теста.</p>
 </section><p class="muted">Список относится к устройствам точки доступа. MAC может быть случайным адресом телефона для этой сети. Смена MAC позволяет обойти запрет.</p>
 </main><script>
 const rows=document.getElementById('rows'),monitor=document.getElementById('monitor');
+const resetAll=document.getElementById('reset-all'),resetMessage=document.getElementById('reset-message');
+let resetting=false;
+resetAll.addEventListener('click',()=>resetPenalties());
+async function resetPenalties(mac){
+if(resetting)return;resetting=true;resetAll.disabled=true;
+try{const r=await fetch('/api/students/reset_penalties',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(mac?{mac}:{})});const data=await r.json();if(!r.ok||!data.ok)throw Error(data.error||'Не удалось сбросить штрафы');resetMessage.textContent=mac?'Штраф студента сброшен. Можно снова открыть страницу теста.':'Все штрафы сброшены. Студенты могут снова открыть страницу теста.';const status=await fetch('/api/students',{cache:'no-store'});if(!status.ok)throw Error('Штрафы сброшены, но список пока не обновился');resetting=false;render(await status.json())}
+catch(e){resetMessage.textContent=e.message}
+finally{resetting=false}
+}
 function cell(tr,text,cls=''){const td=document.createElement('td');td.textContent=text;td.className=cls;tr.append(td);return td}
 function render(data){
 monitor.classList.toggle('warning',!data.healthy);
-monitor.textContent=data.healthy?'Контроль Wi-Fi работает · блокировка сайта на 10 минут':(data.error||'Нет связи со службой контроля Wi-Fi')+'. Контроль доступа приостановлен до восстановления данных.';
+monitor.textContent=data.healthy?(data.penalties_active?'Контроль Wi-Fi работает · штрафы включены на время тестирования':'Контроль Wi-Fi работает · штрафы выключены, тестирование не идёт'):(data.error||'Нет связи со службой контроля Wi-Fi')+'. Контроль доступа приостановлен до восстановления данных.';
 rows.replaceChildren();let connected=0,blocked=0;
 for(const s of data.stations){const tr=document.createElement('tr');const n=s.remaining_seconds||0;if(s.connected&&data.healthy)connected++;if(n)blocked++;
 cell(tr,s.name||s.hostname||'Без имени');cell(tr,s.ip||'—');cell(tr,s.mac,'mac');
 cell(tr,data.healthy?(s.connected?'Подключён':'Отключён'):'Нет данных');
 const td=cell(tr,'');const badge=document.createElement('span');badge.className='badge '+(n?'blocked':s.connected?'connected':'');
-badge.textContent=n?'Запрет '+Math.floor(n/60)+':'+String(n%60).padStart(2,'0'):(s.registered?'Разрешён':'Ещё не входил');td.append(badge);rows.append(tr)}
+badge.textContent=n?'Запрет '+Math.floor(n/60)+':'+String(n%60).padStart(2,'0'):(s.registered?'Разрешён':'Ещё не входил');td.append(badge);
+const action=cell(tr,'—');if(n&&data.can_reset_penalties){action.textContent='';const button=document.createElement('button');button.type='button';button.textContent='Обнулить';button.disabled=resetting;button.addEventListener('click',()=>resetPenalties(s.mac));action.append(button)}rows.append(tr)}
+resetAll.hidden=!data.can_reset_penalties;resetAll.disabled=resetting||!blocked;
 document.getElementById('empty').hidden=data.stations.length>0;
 document.getElementById('summary').textContent='В Wi-Fi: '+connected+' · Вход запрещён: '+blocked;
 }

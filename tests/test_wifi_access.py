@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -59,6 +60,17 @@ class GuardTests(unittest.TestCase):
             restored.unavailable()
             self.assertEqual(restored.records[MAC]['blocked_until'], 710)
 
+    def test_second_disconnect_remains_observable_without_extending_old_interval(self):
+        guard = monitor.Guard()
+        guard.connect(MAC, 100)
+        guard.disconnect(MAC, 110)
+        guard.tick(112, lambda: None)
+        guard.connect(MAC, 120)
+        guard.disconnect(MAC, 130)
+        guard.tick(132, lambda: None)
+        self.assertEqual(guard.records[MAC]['last_disconnect_at'], 130)
+        self.assertEqual(guard.records[MAC]['blocked_until'], 710)
+
 
 class AccessTests(unittest.TestCase):
     def setUp(self):
@@ -72,7 +84,15 @@ class AccessTests(unittest.TestCase):
         for item in self.patches:
             item.start()
             self.addCleanup(item.stop)
+        state_patch = patch.object(main, 'state', main.AppState())
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
         self.write_status()
+
+    def start_test(self, when=None):
+        main.state.test_started = True
+        main.state.started_at = datetime.fromtimestamp(time.time() if when is None else when, timezone.utc)
+        return main.state.started_at.timestamp()
 
     def write_status(self, **fields):
         self.row = {'mac': MAC, 'ip': IP, 'connected': True, **fields}
@@ -111,6 +131,7 @@ class AccessTests(unittest.TestCase):
     def test_real_wifi_break_denies_http_and_ws_then_expires(self):
         now = time.time()
         with TestClient(main.app, client=(IP, 1234)) as client:
+            self.start_test(now)
             self.assertEqual(client.get('/').status_code, 200)
             with client.websocket_connect('/ws/student?name=Student') as ws:
                 self.assertEqual(ws.receive_json()['type'], 'joined')
@@ -124,22 +145,101 @@ class AccessTests(unittest.TestCase):
                 with self.assertRaises(WebSocketDisconnect) as closed:
                     ws.receive_json()
                 self.assertEqual(closed.exception.code, 4403)
-            self.write_status(blocked_at=now - 601, blocked_until=now - 1)
-            self.assertEqual(client.get('/').status_code, 200)
+            with patch.object(wifi_access.time, 'time', return_value=now + 602):
+                self.write_status(blocked_at=now + 1, blocked_until=now + 601)
+                self.assertEqual(wifi_access.blocked(IP, main.wifi_penalty_start()), 0)
 
     def test_first_visit_after_old_wifi_disconnect_is_not_punished(self):
         now = time.time()
         self.write_status(blocked_at=now - 10, blocked_until=now + 590)
         wifi_access.remember(IP)
-        self.assertEqual(wifi_access.blocked(IP), 0)
+        self.assertEqual(wifi_access.blocked(IP, self.start_test(now - 20)), 0)
 
     def test_registration_and_name_survive_web_restart_and_ip_change(self):
         wifi_access.remember(IP, 'Student')
         now = time.time()
         self.write_status(blocked_at=now + 1, blocked_until=now + 601, ip='10.10.10.101')
-        self.assertGreater(wifi_access.blocked('10.10.10.101'), 0)
-        self.assertEqual(wifi_access.students()['stations'][0]['name'], 'Student')
-        self.assertEqual(wifi_access.blocked(IP), 0)
+        since = self.start_test(now)
+        self.assertGreater(wifi_access.blocked('10.10.10.101', since), 0)
+        self.assertEqual(wifi_access.students(since)['stations'][0]['name'], 'Student')
+        self.assertEqual(wifi_access.blocked(IP, since), 0)
+
+    def test_lobby_disconnect_never_blocks_http_or_websocket_or_later_test(self):
+        now = time.time()
+        with TestClient(main.app, client=(IP, 1234)) as client:
+            wifi_access.remember(IP, 'Student')
+            self.write_status(blocked_at=now + 1, blocked_until=now + 601)
+            self.assertEqual(client.get('/').status_code, 200)
+            self.assertFalse(client.get('/api/students').json()['penalties_active'])
+            self.assertEqual(client.get('/api/students').json()['stations'][0]['remaining_seconds'], 0)
+            with client.websocket_connect('/ws/student?name=Student') as ws:
+                self.assertEqual(ws.receive_json()['type'], 'joined')
+            self.start_test(now + 2)
+            self.assertEqual(client.get('/').status_code, 200)
+            self.assertEqual(client.get('/api/students').json()['stations'][0]['remaining_seconds'], 0)
+
+    def test_penalties_stop_applying_after_test_finishes(self):
+        now = time.time()
+        wifi_access.remember(IP, 'Student')
+        self.write_status(blocked_at=now + 1, blocked_until=now + 601)
+        self.start_test(now)
+        self.assertGreater(wifi_access.blocked(IP, main.wifi_penalty_start()), 0)
+        main.state.test_started = False
+        main.state.test_finished = True
+        self.assertEqual(wifi_access.blocked(IP, main.wifi_penalty_start()), 0)
+
+    def test_individual_and_global_reset_preserve_names_answers_and_progress(self):
+        now = time.time()
+        second = '02:11:22:33:44:66'
+        with TestClient(main.app, client=('127.0.0.1', 1234)) as client:
+            wifi_access.remember(IP, 'Student')
+            with wifi_access.database() as db:
+                db.execute('INSERT INTO devices VALUES (?, ?, ?)', (second, now, 'Second'))
+            self.start_test(now)
+            self.path.write_text(json.dumps({'updated_at': time.time(), 'healthy': True, 'stations': [
+                {'mac': mac, 'ip': ip, 'connected': True, 'blocked_at': now + 1, 'blocked_until': now + 601}
+                for mac, ip in [(MAC, IP), (second, '10.10.10.101')]]}))
+            main.state.answers = {'student': {'q': [0]}}
+            main.state.progress = {'student': {'index': 2, 'deadline': 123}}
+            self.assertTrue(all(row['remaining_seconds'] for row in client.get('/api/students').json()['stations']))
+            self.assertEqual(client.post('/api/students/reset_penalties', json={'mac': MAC}).status_code, 200)
+            # The unchanged privileged snapshot must not restore a forgiven penalty.
+            status = {row['mac']: row for row in client.get('/api/students').json()['stations']}
+            self.assertEqual(status[MAC]['remaining_seconds'], 0)
+            self.assertGreater(status[second]['remaining_seconds'], 0)
+            self.assertEqual(client.post('/api/students/reset_penalties', json={}).status_code, 200)
+            self.assertTrue(all(row['remaining_seconds'] == 0 for row in client.get('/api/students').json()['stations']))
+            self.assertEqual(wifi_access.registered()[MAC]['name'], 'Student')
+            self.assertEqual(main.state.answers, {'student': {'q': [0]}})
+            self.assertEqual(main.state.progress['student']['index'], 2)
+            self.assertTrue(main.state.test_started)
+
+    def test_new_break_after_forgiveness_is_penalized_without_extending_on_retries(self):
+        now = time.time()
+        wifi_access.remember(IP, 'Student')
+        since = self.start_test(now)
+        self.write_status(blocked_at=now + 1, blocked_until=now + 601, last_disconnect_at=now + 1)
+        self.assertGreater(wifi_access.blocked(IP, since), 0)
+        wifi_access.reset_penalties(MAC)
+        self.assertEqual(wifi_access.blocked(IP, since), 0)
+        self.write_status(blocked_at=now + 1, blocked_until=now + 601, last_disconnect_at=now + 2)
+        self.assertGreater(wifi_access.blocked(IP, since), 0)
+        with wifi_access.database() as db:
+            until = db.execute('SELECT blocked_until FROM penalties WHERE mac=?', (MAC,)).fetchone()[0]
+        self.write_status(blocked_at=now + 1, blocked_until=now + 601, last_disconnect_at=now + 3)
+        wifi_access.blocked(IP, since)
+        with wifi_access.database() as db:
+            self.assertEqual(db.execute('SELECT blocked_until FROM penalties WHERE mac=?', (MAC,)).fetchone()[0], until)
+
+    def test_student_and_cross_origin_form_cannot_forgive_penalties(self):
+        with TestClient(main.app, client=(IP, 1234)) as client:
+            self.assertFalse(client.get('/api/students').json()['can_reset_penalties'])
+            self.assertEqual(client.post('/api/students/reset_penalties', json={}).status_code, 403)
+        with TestClient(main.app, client=('10.10.10.1', 1234)) as client:
+            self.assertTrue(client.get('/api/students').json()['can_reset_penalties'])
+            self.assertEqual(client.post('/api/students/reset_penalties', content='{}',
+                                         headers={'Content-Type': 'text/plain'}).status_code, 415)
+            self.assertEqual(client.post('/api/students/reset_penalties', json={'mac': 'invalid'}).status_code, 400)
 
     def test_unknown_monitor_is_reported_without_false_block(self):
         self.path.unlink()

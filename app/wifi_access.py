@@ -33,6 +33,9 @@ def database():
     db.execute('CREATE TABLE IF NOT EXISTS devices (mac TEXT PRIMARY KEY, first_seen REAL NOT NULL, name TEXT NOT NULL)')
     try:
         with db:
+            db.execute('CREATE TABLE IF NOT EXISTS penalties '
+                       '(mac TEXT PRIMARY KEY, cleared_at REAL NOT NULL DEFAULT 0, '
+                       'event_at REAL NOT NULL DEFAULT 0, blocked_until REAL NOT NULL DEFAULT 0)')
             yield db
     finally:
         db.close()
@@ -42,6 +45,7 @@ def reset_session():
     """Forget registrations and penalties belonging to the previous test session."""
     with database() as db:
         db.execute('DELETE FROM devices')
+        db.execute('DELETE FROM penalties')
 
 
 def registered():
@@ -68,24 +72,58 @@ def remember(ip, name=''):
     return mac
 
 
-def remaining(row, registration, now=None):
+def reset_penalties(mac=None):
+    """Forgive existing events without deleting registrations or test answers."""
+    now = time.time()
+    events = {row['mac']: row.get('last_disconnect_at', row.get('blocked_at', 0))
+              for row in snapshot()['stations']}
+    with database() as db:
+        devices = list(db.execute('SELECT mac FROM devices' + (' WHERE mac=?' if mac else ''),
+                                  (mac,) if mac else ()))
+        for (device,) in devices:
+            db.execute('INSERT INTO penalties (mac, cleared_at, event_at) VALUES (?, ?, ?) '
+                       'ON CONFLICT(mac) DO UPDATE SET cleared_at=excluded.cleared_at, '
+                       'event_at=MAX(penalties.event_at, excluded.event_at), blocked_until=0',
+                       (device, now, max(now, events.get(device, 0))))
+    return len(devices)
+
+
+def remaining(row, registration, since=None, now=None):
+    """Consume confirmed Wi-Fi events only inside the current active test window."""
     now = time.time() if now is None else now
-    if not registration or registration['first_seen'] > row.get('blocked_at', 0):
+    if since is None or not registration:
         return 0
-    return max(0, math.ceil(row.get('blocked_until', 0) - now))
+    # New monitors report every confirmed break, including during an older interval.
+    # The fallback keeps existing monitor installations compatible during an update.
+    event = row.get('last_disconnect_at', row.get('blocked_at', 0))
+    with database() as db:
+        saved = db.execute('SELECT cleared_at, event_at, blocked_until FROM penalties WHERE mac=?',
+                           (row['mac'],)).fetchone() or (0, 0, 0)
+        cleared, previous_event, until = saved
+        cutoff = max(since, registration['first_seen'], cleared)
+        if event > previous_event:
+            if event > cutoff and event >= until:
+                until = event + 600
+            db.execute('INSERT INTO penalties VALUES (?, ?, ?, ?) '
+                       'ON CONFLICT(mac) DO UPDATE SET event_at=excluded.event_at, '
+                       'blocked_until=excluded.blocked_until',
+                       (row['mac'], cleared, event, until))
+    return max(0, math.ceil(until - now))
 
 
-def blocked(ip):
+def blocked(ip, since=None):
+    if since is None:
+        return 0
     data = snapshot()
     if not data['healthy']:
         return 0  # An old IP-to-MAC mapping cannot identify a current client reliably.
     row = device_for_ip(data, ip)
     if row is None:
         return 0
-    return remaining(row, registered().get(row['mac']))
+    return remaining(row, registered().get(row['mac']), since)
 
 
-def students():
+def students(since=None):
     data = snapshot()
     devices = registered()
     rows = []
@@ -93,7 +131,7 @@ def students():
         registration = devices.get(row['mac'])
         if registration is None and not row.get('connected'):
             continue
-        seconds = remaining(row, registration)
+        seconds = remaining(row, registration, since) if data['healthy'] else 0
         rows.append({**row, 'name': registration['name'] if registration else '',
                      'registered': registration is not None, 'remaining_seconds': seconds,
                      'status': ('blocked' if seconds else 'unknown' if not data['healthy'] else
@@ -103,17 +141,18 @@ def students():
     rows.extend({'mac': mac, 'name': value['name'], 'registered': True,
                  'remaining_seconds': 0, 'status': 'unknown'}
                 for mac, value in devices.items() if mac not in known)
-    return {**data, 'stations': rows}
+    return {**data, 'stations': rows, 'penalties_active': since is not None}
 
 
 class WifiAccessMiddleware:
-    def __init__(self, app):
+    def __init__(self, app, test_start=lambda: None):
         self.app = app
+        self.test_start = test_start
 
     async def __call__(self, scope, receive, send):
         if scope['type'] in ('http', 'websocket'):
             ip = (scope.get('client') or ('', 0))[0]
-            seconds = blocked(ip)
+            seconds = blocked(ip, self.test_start())
             if seconds:
                 if scope['type'] == 'websocket':
                     await send({'type': 'websocket.accept'})

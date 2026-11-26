@@ -56,10 +56,9 @@ class Guard:
         row = self.records.get(mac)
         if row and row.get('connected'):
             row['connected'] = False
-            if row.get('blocked_until', 0) > now:
-                return
             row['disconnected_at'] = now
-            # Defer enforcement briefly to discard AP shutdown's mass disconnect events.
+            # Defer briefly to discard AP shutdown events, but keep every confirmed
+            # break observable after a teacher forgives an older interval.
             self.pending.setdefault(mac, now)
 
     def unavailable(self):
@@ -77,9 +76,10 @@ class Guard:
             if now - since < 2:
                 continue
             row = self.records[mac]
+            row['last_disconnect_at'] = since
             if row.get('blocked_until', 0) <= now:
                 row.update(blocked_until=since + DURATION, blocked_at=since)
-                save()  # A monitor restart must keep the original deadline.
+            save()  # A monitor restart must keep confirmed events and the original deadline.
             del self.pending[mac]
 
     def event(self, event, now):
@@ -107,7 +107,7 @@ def load_records(path=STATE):
     for mac, row in data.items():
         if not MAC.fullmatch(mac) or not isinstance(row, dict):
             raise ValueError('Invalid Wi-Fi state entry')
-        for field in ('blocked_until', 'blocked_at', 'last_seen', 'disconnected_at'):
+        for field in ('blocked_until', 'blocked_at', 'last_seen', 'disconnected_at', 'last_disconnect_at'):
             if field in row and (type(row[field]) not in (int, float) or not 0 <= row[field] < 1e12):
                 raise ValueError('Invalid Wi-Fi timestamp')
     return data

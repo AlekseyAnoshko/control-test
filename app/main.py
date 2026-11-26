@@ -18,6 +18,7 @@ Control-test: сервис для проведения тестирования 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from decimal import Decimal, InvalidOperation
 import re
 import uuid
@@ -53,7 +54,7 @@ async def lifespan(app):
 
 app = FastAPI(title="Control Test", lifespan=lifespan)
 
-app.add_middleware(wifi_access.WifiAccessMiddleware)
+app.add_middleware(wifi_access.WifiAccessMiddleware, test_start=lambda: wifi_penalty_start())
 app.add_middleware(ai_warning.AIWarningMiddleware)
 
 APP_DIR = Path(__file__).resolve().parent
@@ -268,6 +269,19 @@ class AppState:
 state = AppState()
 
 
+def wifi_penalty_start():
+    return state.started_at.timestamp() if state.test_started and state.started_at else None
+
+
+def can_reset_penalties(request):
+    # Teacher controls are local to the laptop, including its own hotspot address.
+    host = request.client.host if request.client else ''
+    try:
+        return ipaddress.ip_address(host).is_loopback or host == '10.10.10.1'
+    except ValueError:
+        return False
+
+
 def reset_participants():
     # Keep students waiting in the current lobby; remove disconnected old sessions.
     state.students = {sid: info for sid, info in state.students.items() if info.get('ws') is not None}
@@ -405,8 +419,34 @@ async def students_page(request: Request):
 
 
 @app.get('/api/students')
-async def students_status():
-    return JSONResponse(wifi_access.students(), headers={'Cache-Control': 'no-store'})
+async def students_status(request: Request):
+    data = wifi_access.students(wifi_penalty_start())
+    data['can_reset_penalties'] = can_reset_penalties(request)
+    return JSONResponse(data, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/students/reset_penalties')
+async def reset_student_penalties(request: Request):
+    if not can_reset_penalties(request):
+        return JSONResponse({'ok': False, 'error': 'Сброс штрафов доступен с ноутбука преподавателя'}, status_code=403)
+    if request.headers.get('content-type', '').split(';')[0].strip().lower() != 'application/json':
+        return JSONResponse({'ok': False, 'error': 'Ожидается JSON'}, status_code=415)
+    try:
+        data = await request.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return JSONResponse({'ok': False, 'error': 'Некорректный запрос'}, status_code=400)
+    mac = data.get('mac')
+    if mac is not None:
+        if not isinstance(mac, str) or not re.fullmatch(r'[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}', mac):
+            return JSONResponse({'ok': False, 'error': 'Некорректный MAC'}, status_code=400)
+        mac = mac.lower()
+    async with state.lock:
+        if mac is not None and mac not in wifi_access.registered():
+            return JSONResponse({'ok': False, 'error': 'Устройство не зарегистрировано'}, status_code=404)
+        count = wifi_access.reset_penalties(mac)
+    return {'ok': True, 'devices': count}
 
 
 async def enforce_wifi_access():
@@ -417,7 +457,7 @@ async def enforce_wifi_access():
                 ws = info.get('ws')
                 if ws is not None:
                     wifi_access.remember(info.get('ip', ''), info.get('name', ''))
-                    if wifi_access.blocked(info.get('ip', '')):
+                    if wifi_access.blocked(info.get('ip', ''), wifi_penalty_start()):
                         await ws.close(code=4403, reason='Wi-Fi disconnected; site blocked for 10 minutes')
         except (OSError, RuntimeError):
             # A vanished socket or temporarily unavailable snapshot must not stop the monitor task.
