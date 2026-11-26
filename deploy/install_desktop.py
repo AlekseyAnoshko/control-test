@@ -28,9 +28,10 @@ StartLimitBurst=10
 Type=simple
 WorkingDirectory={str(project).replace('%', '%%')}
 Environment=PYTHONUNBUFFERED=1
-ExecStart={unit_quote(project / '.venv/bin/python')} -m uvicorn app.main:app --host 10.10.10.1 --port 8000 --workers 1
+ExecStart={unit_quote(project / '.venv/bin/python')} -m uvicorn app.main:app --host 10.10.10.1 --port 8000 --workers 1 --timeout-graceful-shutdown 5
 Restart=on-failure
 RestartSec=3
+KillMode=control-group
 TimeoutStopSec=15
 UMask=0077
 '''
@@ -61,8 +62,9 @@ def install(project, home, desktop):
     unit.parent.mkdir(parents=True, exist_ok=True)
     helper.parent.mkdir(parents=True, exist_ok=True)
     desktop.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(project / 'deploy/desktop_control.py', helper)
-    helper.chmod(0o755)
+    # Keep desktop buttons on the checked-out version after future git updates.
+    helper.unlink(missing_ok=True)
+    helper.symlink_to((project / 'deploy/desktop_control.py').resolve())
     unit.write_text(service_content(project))
     launchers = []
     for action in ('start', 'stop'):
@@ -99,6 +101,7 @@ def main():
     print('Запуск: systemctl --user start ' + UNIT)
     print('Журнал: journalctl --user -u ' + UNIT + ' -n 40 --no-pager')
     print('Сервис запускается кнопкой, автоматический запуск при входе не включён.')
+    print('Кнопки используют скрипт из проекта и обновляются вместе с git checkout.')
     print('При первом открытии ярлыка рабочий стол может предложить разрешить запуск.')
 
 
