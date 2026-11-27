@@ -3,7 +3,7 @@
 Цель: сохранить обычный веб-доступ в Интернет, закрыть известные AI-домены
 и предоставить локальный тест. Строгого режима без Интернета нет.
 
-Встроенный `wlp3s0` — WAN-клиент внешнего Wi-Fi. USB `wlx00127b21755b` —
+Встроенный `wlp3s0` — WAN-клиент внешнего Wi-Fi. USB AICSemi `wlx001d43501e71` —
 AP студентов, `10.10.10.1/24`. Это маршрутизатор с NAT, не сетевой мост.
 Имена интерфейсов, адреса, DNS и порт задаются в `gateway.json`.
 
@@ -75,13 +75,13 @@ sudo systemctl enable --now control-test-firewall.service
 sudo systemctl disable --now dnsmasq.service
 sudo systemctl stop control-test-dnsmasq.service
 sudo nmcli connection modify control-test-hotspot \
-  connection.interface-name wlx00127b21755b \
-  connection.autoconnect yes ipv4.method manual \
+  connection.interface-name wlx001d43501e71 \
+  connection.autoconnect yes connection.autoconnect-priority 100 ipv4.method manual \
   ipv4.addresses 10.10.10.1/24 ipv4.gateway "" ipv4.dns "" \
   ipv4.never-default yes ipv6.method disabled \
   802-11-wireless.ap-isolation yes
 sudo nmcli connection down control-test-hotspot
-sudo nmcli connection up control-test-hotspot ifname wlx00127b21755b
+sudo nmcli connection up control-test-hotspot ifname wlx001d43501e71
 sudo systemctl enable --now control-test-dnsmasq.service
 ```
 

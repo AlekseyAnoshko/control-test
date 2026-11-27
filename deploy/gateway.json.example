@@ -1,5 +1,5 @@
 {
-  "ap_interface": "wlx00127b21755b",
+  "ap_interface": "wlx001d43501e71",
   "wan_interface": "wlp3s0",
   "address": "10.10.10.1/24",
   "dhcp_start": "10.10.10.100",
